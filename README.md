@@ -21,10 +21,10 @@ verify parses each entry, attempts decoding, checks unpacked size for decoded en
 
 ## Modified repack behavior
 
-repack rebuilds a new archive; it never copies the source archive as the output. It reads every manifest entry from --input-dir, validates the manifest source SHA-256, and writes a new payload area, 0x10-aligned index, preserved 0x400-byte V3 trailer, and regenerated FilePackVer3.0 footer.
+repack rebuilds a new archive; it never copies the source archive as the output. It reads every manifest entry from --input-dir, validates the manifest source SHA-256, and writes payloads in the source physical order without adding per-entry alignment, preserves the source IndexOffset, copies the complete source index-to-trailer HashVer1.3 region byte-for-byte, preserves the 0x400-byte V3 trailer, and writes a FilePackVer3.0 footer with the source index offset.
 
 - Unchanged extracted files reuse their original stored payload bytes and original packed/encryption/hash metadata.
-- Changed decoded files are emitted as new literal, unpacked payloads with recalculated stored/unpacked sizes and a regenerated encrypted CP932 name. The built-in codec intentionally does not implement 1PC compression.
+- Changed decoded files are emitted as new literal, unpacked payloads. The built-in codec intentionally does not implement 1PC compression; packed entries are rejected for edits rather than being mislabeled as packed=false. To preserve the source HashVer1.3 region and all later offsets, edited stored payloads must remain exactly the source StoredSize; size-changing edits are rejected conservatively.
 - Changed raw .qlie-raw entries are rejected because their decoded representation is unknown.
 - Changed encryption!=0 entries use the built-in `QlieV3EntryCipher`, which is the inverse of the GARbro reader's per-block XOR/state transform. Changed decoded payloads are emitted as literal (`packed=false`), retain the source encryption mode, and are decrypted again by the reader in the synthetic roundtrip test. The transform processes complete 64-bit blocks exactly as the reader does; a tail shorter than 8 bytes is preserved byte-for-byte, matching the reader.
 - The active `pack_keyfile` entry is rejected when edited because changing it would invalidate the active key chain used by all following entries. Ordinary encrypted entries use their recorded active key.

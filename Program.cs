@@ -180,13 +180,13 @@ public static class Program
             var manifestPath = Path.Combine(root, "manifest.json");
             RunExtract(new[] { "extract", archivePath, outDir, "--manifest", manifestPath });
             var roundtrip = Path.Combine(root, "roundtrip.pack");
-            File.WriteAllText(Path.Combine(outDir, "hello.txt"), "hello from modified repack", new UTF8Encoding(false));
+            File.WriteAllText(Path.Combine(outDir, "hello.txt"), "hello TEST", new UTF8Encoding(false));
             RunRepack(new[] { "repack", manifestPath, roundtrip, "--source", archivePath, "--input-dir", outDir });
             using (var rewritten = QlieArchive.Open(roundtrip, null))
             {
                 using var changed = rewritten.OpenDecoded(rewritten.Entries[0]);
                 using var sr = new StreamReader(changed, Encoding.UTF8);
-                if (sr.ReadToEnd() != "hello from modified repack") throw new Exception("edited payload was not repacked");
+                if (sr.ReadToEnd() != "hello TEST") throw new Exception("edited payload was not repacked");
                 using var beforeRaw = QlieArchive.Open(archivePath, null);
                 using var oldStored = beforeRaw.OpenStored(beforeRaw.Entries[1]);
                 using var newStored = rewritten.OpenStored(rewritten.Entries[1]);
@@ -339,12 +339,35 @@ public sealed class QlieArchive : IDisposable
     public int VersionMinor { get; }
     public string Version => $"{VersionMajor}.{VersionMinor}";
     public long IndexOffset { get; }
+    public long IndexEnd { get; private set; }
     public List<QlieEntry> Entries { get; } = new();
     private readonly uint arcKey;
     private readonly byte[] trailerBlock;
     private readonly long trailerStart;
     public long TrailerStart => trailerStart;
     public byte[] CopyTrailerBlock() => trailerBlock.ToArray();
+    public byte[] CopyFooter() => CopyRange(file.Length - 0x1c, 0x1c);
+    public byte[] CopyIndexTrailerGap() => CopyRange(IndexEnd, checked((int)(trailerStart - IndexEnd)));
+    public void CopyRangeTo(Stream destination, long offset, long length)
+    {
+        if (offset < 0 || length < 0 || offset > file.Length - length) throw new ArgumentOutOfRangeException();
+        file.Position = offset;
+        var buffer = new byte[1 << 20];
+        while (length > 0)
+        {
+            var want = (int)Math.Min(buffer.Length, length);
+            var read = file.Read(buffer, 0, want);
+            if (read == 0) throw new EndOfStreamException();
+            destination.Write(buffer, 0, read);
+            length -= read;
+        }
+    }
+    private byte[] CopyRange(long offset, int length)
+    {
+        using var ms = new MemoryStream(length);
+        CopyRangeTo(ms, offset, length);
+        return ms.ToArray();
+    }
     public uint ArcKey => arcKey;
 
     private readonly byte[]? gameKeyData;
@@ -400,6 +423,8 @@ public sealed class QlieArchive : IDisposable
             }
             file.Position = nextIndex;
         }
+        IndexEnd = file.Position;
+        if (IndexEnd > trailerStart) throw new InvalidDataException("QLIE index overlaps the 0x400-byte V3 trailer block");
     }
 
     public byte[] EncodeName(string name)
@@ -615,6 +640,8 @@ public static class QlieRepacker
                 throw new UnsupportedEncryptedRewriteException($"entry {source.Index} is the active pack_keyfile; editing it would invalidate the active key chain for entries {source.Index + 1}..{archive.Entries.Count - 1} (offset=0x{source.Offset:X})");
             if (source.Encryption != 0 && cipher == null)
                 throw new UnsupportedEncryptedRewriteException($"entry {source.Index} edited encrypted payload at offset 0x{source.Offset:X}; provide IV3EntryCipher to prove inverse V3 encryption/signature generation");
+            if (source.Packed)
+                throw new UnsupportedEncryptedRewriteException($"entry {source.Index} is packed; the built-in writer has no proven 1PC encoder, so literal packed=false output is rejected");
             var decoded = File.ReadAllBytes(path);
             var encoded = codec.Encode(decoded, source);
             var encryption = 0;
@@ -625,25 +652,39 @@ public static class QlieRepacker
                 encryption = source.Encryption;
             }
             items.Add(new QlieRepackItem { Name=source.Name, Stored=encoded, UnpackedSize=checked((uint)decoded.Length), Packed=packed,
-                Encryption=encryption, Hash=hashProvider.ComputeHash(decoded, source), RawName=archive.EncodeName(source.Name), Source=source });
+                Encryption=encryption, Hash=hashProvider.ComputeHash(decoded, source), RawName=source.RawName.ToArray(), Source=source });
         }
         WriteArchive(archive, items, outputPath, trailerOverride);
     }
 
     private static void WriteArchive(QlieArchive archive, IReadOnlyList<QlieRepackItem> items, string outputPath, byte[]? trailerOverride)
     {
-        var indexOffset = 0L;
+        if (items.Count != archive.Entries.Count) throw new InvalidDataException("repack item count does not match source archive");
         var offsets = new long[items.Count];
         Directory.CreateDirectory(Path.GetDirectoryName(outputPath)!);
         using var output = new FileStream(outputPath, FileMode.CreateNew, FileAccess.Write, FileShare.None, 1 << 20, FileOptions.SequentialScan);
+
+        // V3 stores payloads in source order with no per-entry alignment requirement.
+        // Keep the exact source offsets/gaps and reject size changes rather than shifting
+        // later payloads while retaining an unverified HashVer1.3 region.
         for (var i = 0; i < items.Count; i++)
         {
-            Align(output, PayloadAlignment);
+            var source = archive.Entries[i];
+            if (i > 0 && source.Offset < archive.Entries[i - 1].Offset + archive.Entries[i - 1].StoredSize)
+                throw new InvalidDataException($"source payload placement is not monotonic at entry {i}");
+            if ((long)items[i].Stored.Length != source.StoredSize)
+                throw new UnsupportedEncryptedRewriteException($"entry {i} stored size changed from {source.StoredSize} to {items[i].Stored.Length}; refusing to shift payloads or claim HashVer1.3 compatibility");
+            if (output.Position > source.Offset) throw new InvalidDataException($"source payload offset already passed at entry {i}");
+            if (output.Position < source.Offset)
+                archive.CopyRangeTo(output, output.Position, source.Offset - output.Position);
             offsets[i] = output.Position;
             output.Write(items[i].Stored, 0, items[i].Stored.Length);
         }
-        Align(output, PayloadAlignment);
-        indexOffset = output.Position;
+        if (output.Position > archive.IndexOffset) throw new InvalidDataException("payloads overlap source index");
+        if (output.Position < archive.IndexOffset)
+            archive.CopyRangeTo(output, output.Position, archive.IndexOffset - output.Position);
+        var indexOffset = output.Position;
+        if (indexOffset != archive.IndexOffset) throw new InvalidDataException("failed to preserve source index offset");
         for (var i = 0; i < items.Count; i++)
         {
             var item = items[i];
@@ -658,11 +699,15 @@ public static class QlieRepacker
             output.Write(BitConverter.GetBytes(item.Encryption));
             output.Write(BitConverter.GetBytes(item.Hash));
         }
+        if (output.Position != archive.IndexEnd) throw new InvalidDataException($"rebuilt index end 0x{output.Position:X} differs from source 0x{archive.IndexEnd:X}");
+        var hashVerGap = archive.CopyIndexTrailerGap();
+        output.Write(hashVerGap, 0, hashVerGap.Length);
+        if (output.Position != archive.TrailerStart) throw new InvalidDataException("failed to preserve source HashVer1.3/trailer position");
         var trailer = trailerOverride ?? archive.CopyTrailerBlock();
         if (trailer.Length != TrailerSize) throw new InvalidDataException("V3 trailer block must be exactly 0x400 bytes");
         output.Write(trailer, 0, trailer.Length);
-        var footer = new byte[FooterSize];
-        Encoding.ASCII.GetBytes("FilePackVer3.0").CopyTo(footer, 0);
+        var footer = archive.CopyFooter();
+        if (footer.Length != FooterSize) throw new InvalidDataException("V3 footer must be exactly 0x1c bytes");
         BitConverter.GetBytes(items.Count).CopyTo(footer, 0x10);
         BitConverter.GetBytes(indexOffset).CopyTo(footer, 0x14);
         output.Write(footer, 0, footer.Length);

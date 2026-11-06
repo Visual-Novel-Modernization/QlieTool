@@ -1,0 +1,14 @@
+bin/
+obj/
+.cli-home/
+.nuget/
+*.user
+*.suo
+*.log
+*.pack
+*.xp3
+*.dll
+*.exe
+*.pdb
+*.cache
+*.json

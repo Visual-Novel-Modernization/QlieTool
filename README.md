@@ -1,0 +1,52 @@
+# QlieTool
+
+Independent .NET 8 console utility for inspecting and rebuilding QLIE FilePackVer3.0 archives. The implementation follows the QLIE reader behavior in GARbro and is tested against a TEMP copy of a second Bishoujo Mangekyou game archive.
+
+## Commands
+
+Run from this directory:
+
+```text
+dotnet run -- list ARCHIVE.pack [--key key.fkey] [--game-key keydata.bin]
+dotnet run -- extract ARCHIVE.pack OUTPUT_DIR [--key key.fkey] [--game-key keydata.bin] [--manifest manifest.json]
+dotnet run -- verify ARCHIVE.pack [--key key.fkey] [--game-key keydata.bin]
+dotnet run -- repack manifest.json OUTPUT.pack --source ARCHIVE.pack --input-dir EXTRACTED_DIR [--key key.fkey] [--game-key keydata.bin]
+dotnet run -- clone manifest.json OUTPUT.pack --source ARCHIVE.pack --input-dir EXTRACTED_DIR [--key key.fkey] [--game-key keydata.bin]
+dotnet run -- self-test
+```
+
+list parses the FilePackVer3.0 footer, 64-bit index offsets, and encrypted CP932 names. extract creates a JSON manifest containing original entry fields, payload/extracted SHA-256 values, and whether each file was decoded. Decodable entries are written under their indexed name. If encrypted/decompressed data is unsupported or invalid, exact stored entry bytes are written as <name>.qlie-raw; this suffix identifies raw stored payload, not the original decoded file. Path traversal is rejected and existing files/manifests are never overwritten.
+
+verify parses each entry, attempts decoding, checks unpacked size for decoded entries, and hashes bytes. When decoding fails it hashes the bounded stored payload and reports it as rawStored; this is a structural/payload-read check, not proof that unsupported raw content is valid after decryption. --game-key supplies optional GameKeyData independently of --key (the external key.fkey).
+
+## Modified repack behavior
+
+repack rebuilds a new archive; it never copies the source archive as the output. It reads every manifest entry from --input-dir, validates the manifest source SHA-256, and writes a new payload area, 0x10-aligned index, preserved 0x400-byte V3 trailer, and regenerated FilePackVer3.0 footer.
+
+- Unchanged extracted files reuse their original stored payload bytes and original packed/encryption/hash metadata.
+- Changed decoded files are emitted as new literal, unpacked payloads with recalculated stored/unpacked sizes and a regenerated encrypted CP932 name. The built-in codec intentionally does not implement 1PC compression.
+- Changed raw .qlie-raw entries are rejected because their decoded representation is unknown.
+- Changed encrypted entries are rejected unless an IV3EntryCipher implementation is injected; the exception reports the entry offset. This avoids inventing an encryption/signature algorithm.
+- The 0x400-byte trailer occupies output EOF-0x41c through EOF-0x1c; its first 0x100 bytes are the ArcKey material used for name encryption. The opaque trailer is preserved byte-for-byte unless a caller supplies a validated replacement through the API. GARbro exposes no V3 writer, and the V3 entry Hash field is preserved for unchanged entries and set to zero for newly literal entries because its writer semantics are not established.
+- Payload encoding is injectable through `IEntryPayloadCodec.Encode(byte[] decoded, QlieEntry sourceEntry)`. V3 encryption/signature generation is injectable through `IV3EntryCipher.Encrypt(byte[] plainPayload, QlieEntry sourceEntry, string entryName)`. The CLI currently uses `PlainEntryPayloadCodec` and no cipher; encrypted edits therefore fail closed.
+
+clone remains a compatibility alias for the same rebuild operation; it is not a byte-copy command. Output must be a new path and must not point into an installed game directory.
+
+## Build and test
+
+```text
+dotnet build QlieTool.csproj
+dotnet run -- self-test
+```
+
+The synthetic test covers FilePackVer3.0 index parsing, CP932 name cipher, 1PC decoding, modified plain payload, unchanged stored-payload reuse, path guards, and rejection of edited raw payloads.
+
+## Tested scope and limitations
+
+On a TEMP copy of the target data0.pack, list read 9 entries at index offset 0x284F4. Extract and verify completed: 2 entries decoded and 7 retained as exact stored payloads with the .qlie-raw suffix. The seven raw entry payload hashes matched the corresponding source ranges. An unchanged rebuilt archive preserves every stored payload, while its regenerated layout/footer is not required to be byte-equal to the source; modified repack is validated by the synthetic fixture. The seven raw entries are not claimed to be decoded, and encrypted edits require an injected cipher. Other packs/games have not been validated.
+
+Archive payloads above the current in-memory decrypt/decompress limit are reported as unsupported; list and bounded raw payload reads use 64-bit offsets. All real archive/key inputs are copied into a unique Windows TEMP directory by the CLI before reading. The repacker writes only to the requested new output path.
+
+## Reference and attribution
+
+The implementation was checked against GARbro QLIE reader files ArcFormats/Qlie/ArcQLIE.cs, Encryption.cs, and QlieMersenneTwister.cs: https://github.com/morkt/GARbro/tree/master/ArcFormats/Qlie . See NOTICE.md for attribution and MIT terms.

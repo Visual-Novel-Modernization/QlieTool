@@ -147,19 +147,20 @@ public static class Program
         var manifest = JsonSerializer.Deserialize<QlieManifest>(File.ReadAllText(manifestPath), JsonOptions)
             ?? throw new InvalidDataException("invalid manifest");
         if (manifest.Format != "QLIE" || manifest.Version != "3.0") throw new InvalidDataException("manifest is not a QLIE V3.0 manifest");
-        if (!string.Equals(Sha256File(source), manifest.SourceSha256, StringComparison.OrdinalIgnoreCase))
-            throw new InvalidDataException("source archive SHA-256 does not match manifest");
         Directory.CreateDirectory(Path.GetDirectoryName(output)!);
+        // Copy source and key material into one unique TEMP staging directory before any hash/read.
         using var input = TempInput.CopyArchive(source, FindOption(args, "--key"), FindOption(args, "--game-key"));
+        if (!string.Equals(Sha256File(input.ArchivePath), manifest.SourceSha256, StringComparison.OrdinalIgnoreCase))
+            throw new InvalidDataException("source archive SHA-256 does not match manifest");
         using var archive = QlieArchive.Open(input.ArchivePath, input.KeyPath, input.GameKeyPath);
-        QlieRepacker.Repack(archive, manifest, inputDir, output, new PlainEntryPayloadCodec(), null, null);
+        QlieRepacker.Repack(archive, manifest, inputDir, output, new PlainEntryPayloadCodec(), new QlieV3EntryCipher(archive), null);
         Console.WriteLine($"repacked modified archive: {output} (opaque 0x400-byte trailer preserved; unknown signatures are not regenerated)");
         return 0;
     }
 
     private static int RunSelfTest()
     {
-        var root = Path.Combine(AppContext.BaseDirectory, "QlieTool-selftest-" + Guid.NewGuid().ToString("N"));
+        var root = Path.Combine(Path.GetTempPath(), "QlieTool-selftest-" + Guid.NewGuid().ToString("N"));
         Directory.CreateDirectory(root);
         try
         {
@@ -200,7 +201,31 @@ public static class Program
                 throw new Exception("edited raw entry was accepted");
             }
             catch (UnsupportedEncryptedRewriteException) { }
-            Console.WriteLine("self-test passed (V3 index/name cipher, 1PC decode, modified payload, unchanged reuse, raw-edit rejection)");
+            var encryptedPath = Path.Combine(root, "encrypted.pack");
+            var encryptedKeyPath = Path.Combine(root, "encrypted.key");
+            var encryptedGamePath = Path.Combine(root, "encrypted.gamekey");
+            SyntheticFixture.CreateEncrypted(encryptedPath, encryptedKeyPath, encryptedGamePath);
+            var encryptedOut = Path.Combine(root, "encrypted-out"); Directory.CreateDirectory(encryptedOut);
+            var encryptedManifest = Path.Combine(root, "encrypted-manifest.json");
+            using (var encryptedArchive = QlieArchive.Open(encryptedPath, encryptedKeyPath, encryptedGamePath))
+            {
+                using var before = encryptedArchive.OpenDecoded(encryptedArchive.Entries[0]);
+                using var beforeMs = new MemoryStream(); before.CopyTo(beforeMs);
+                if (!beforeMs.ToArray().SequenceEqual(SyntheticFixture.EncryptedPlain)) throw new Exception("encrypted fixture decode failed");
+            }
+            RunExtract(new[] { "extract", encryptedPath, encryptedOut, "--key", encryptedKeyPath, "--game-key", encryptedGamePath, "--manifest", encryptedManifest });
+            var encryptedFile = Path.Combine(encryptedOut, "cipher.bin");
+            File.WriteAllBytes(encryptedFile, Enumerable.Range(0, 32).Select(i => (byte)(0x90 + i)).ToArray());
+            var encryptedRoundtrip = Path.Combine(root, "encrypted-roundtrip.pack");
+            RunRepack(new[] { "repack", encryptedManifest, encryptedRoundtrip, "--source", encryptedPath, "--input-dir", encryptedOut, "--key", encryptedKeyPath, "--game-key", encryptedGamePath });
+            using (var rewrittenEncrypted = QlieArchive.Open(encryptedRoundtrip, encryptedKeyPath, encryptedGamePath))
+            using (var after = rewrittenEncrypted.OpenDecoded(rewrittenEncrypted.Entries[0]))
+            using (var afterMs = new MemoryStream())
+            {
+                after.CopyTo(afterMs);
+                if (!afterMs.ToArray().SequenceEqual(File.ReadAllBytes(encryptedFile))) throw new Exception("encrypted repack readback failed");
+            }
+            Console.WriteLine("self-test passed (V3 index/name cipher, 1PC decode, modified payload, unchanged reuse, encrypted decode/repack/readback, raw-edit rejection)");
             return 0;
         }
         finally { try { Directory.Delete(root, true); } catch { } }
@@ -247,7 +272,11 @@ public sealed class TempInput : IDisposable
             var candidates = new[] { Path.Combine(Path.GetDirectoryName(archive)!, "key.fkey"), Path.Combine(Path.GetDirectoryName(archive)!, "DLL", "key.fkey"), Path.Combine(Path.GetDirectoryName(archive)!, "..", "DLL", "key.fkey") };
             key = candidates.FirstOrDefault(File.Exists);
         }
-        if (key != null && File.Exists(key)) { k = Path.Combine(d, "key.fkey"); File.Copy(Path.GetFullPath(key), k); }
+        if (key != null)
+        {
+            if (!File.Exists(key)) throw new FileNotFoundException("key", key);
+            k = Path.Combine(d, "key.fkey"); File.Copy(Path.GetFullPath(key), k);
+        }
         string? g = null;
         if (gameKey != null && File.Exists(gameKey)) { g = Path.Combine(d, "game.keydata"); File.Copy(Path.GetFullPath(gameKey), g); }
         return new TempInput(a, k, g, d);
@@ -316,6 +345,7 @@ public sealed class QlieArchive : IDisposable
     private readonly long trailerStart;
     public long TrailerStart => trailerStart;
     public byte[] CopyTrailerBlock() => trailerBlock.ToArray();
+    public uint ArcKey => arcKey;
 
     private readonly byte[]? gameKeyData;
     private QlieArchive(FileStream f, byte[]? key, byte[]? gameKey, int major, int minor, long indexOffset, uint arc, byte[] trailer, long trailerAt)
@@ -425,36 +455,7 @@ public sealed class QlieArchive : IDisposable
     }
 
     private void DecryptEntry(byte[] data, QlieEntry entry, byte[] keyFileBytes, byte[]? gameKeyData)
-    {
-        if (data.Length < 8) return;
-        var length=(uint)data.Length;
-        if (gameKeyData == null || gameKeyData.Length == 0)
-        {
-            // GARbro EncryptionV2 fallback used when no GameKeyData is selected.
-            ulong fallbackHash=0xA73C5F9DA73C5F9DUL;
-            ulong xor=((ulong)(length + arcKey) ^ 0xFEC9753Eu); xor |= xor << 32;
-            for(var i=0;i<data.Length/8;i++) {
-                fallbackHash=PackedMath.AddD(fallbackHash,0xCE24F523CE24F523UL)^xor;
-                xor=BitConverter.ToUInt64(data,i*8)^fallbackHash; BitConverter.GetBytes(xor).CopyTo(data,i*8);
-            }
-            return;
-        }
-        uint hash=0x85F532, seed=0x33F641;
-        for (uint i=0;i<entry.RawName.Length;i++) { hash += (i & 0xff) * entry.RawName[i]; seed ^= hash; }
-        seed += arcKey ^ (7*(length & 0xffffff)+length+hash+(hash^length^0x8f32dcu));
-        seed = 9*(seed & 0xffffff);
-        seed ^= 0x453Au;
-        var mt=new QlieMersenneTwister(seed);
-        mt.XorState(keyFileBytes); mt.XorState(gameKeyData);
-        var table=new ulong[16]; for(var i=0;i<table.Length;i++) table[i]=mt.Rand64();
-        for(var i=0;i<9;i++) mt.Rand();
-        ulong hash64=mt.Rand64(); uint t2=mt.Rand()&0xf;
-        for(var i=0;i<data.Length/8;i++) {
-            hash64=PackedMath.AddD(hash64^table[t2],table[t2]);
-            var d=BitConverter.ToUInt64(data,i*8)^hash64; BitConverter.GetBytes(d).CopyTo(data,i*8);
-            hash64=PackedMath.AddB(hash64,d)^d; hash64=PackedMath.AddW(PackedMath.ShiftD(hash64,1),d); t2=(t2+1)&0xf;
-        }
-    }
+        => QlieV3EntryCipher.Transform(data, entry, arcKey, keyFileBytes, gameKeyData, false);
 
     public void Dispose() => file.Dispose();
     private static byte[] ReadBytes(Stream s,long pos,int length){s.Position=pos;return ReadExactly(s,length);}
@@ -491,6 +492,16 @@ public interface IV3EntryCipher
     byte[] Encrypt(byte[] plainPayload, QlieEntry sourceEntry, string entryName);
 }
 
+public interface IEntryHashProvider
+{
+    uint ComputeHash(byte[] decodedPayload, QlieEntry sourceEntry);
+}
+
+public sealed class PreserveSourceEntryHashProvider : IEntryHashProvider
+{
+    public uint ComputeHash(byte[] decodedPayload, QlieEntry sourceEntry) => sourceEntry.Hash;
+}
+
 public sealed class PlainEntryPayloadCodec : IEntryPayloadCodec
 {
     public byte[] Encode(byte[] decoded, QlieEntry sourceEntry) => decoded.ToArray();
@@ -508,6 +519,67 @@ public sealed class QlieRepackItem
     public required QlieEntry Source { get; init; }
 }
 
+public sealed class QlieV3EntryCipher : IV3EntryCipher
+{
+    private readonly uint arcKey;
+    public QlieV3EntryCipher(QlieArchive archive) { arcKey = archive.ArcKey; }
+
+    public byte[] Encrypt(byte[] plainPayload, QlieEntry sourceEntry, string entryName)
+    {
+        if (sourceEntry.Encryption == 0) return plainPayload.ToArray();
+        var key = sourceEntry.KeyFile ?? throw new UnsupportedEncryptedRewriteException($"entry {sourceEntry.Index} has encryption={sourceEntry.Encryption} but no key material");
+        var result = plainPayload.ToArray();
+        Transform(result, sourceEntry, arcKey, key, sourceEntry.GameKeyData, true);
+        return result;
+    }
+
+    // GARbro's V3 reader processes only complete little-endian 64-bit blocks.
+    // The remaining tail is intentionally preserved byte-for-byte, matching reader semantics.
+    internal static void Transform(byte[] data, QlieEntry entry, uint arcKey, byte[] keyFile, byte[]? gameKey, bool encrypt)
+    {
+        if (data.Length < 8) return;
+        var length = (uint)data.Length;
+        if (gameKey == null || gameKey.Length == 0)
+        {
+            ulong state = 0xA73C5F9DA73C5F9DUL;
+            ulong feedback = ((ulong)(length + arcKey) ^ 0xFEC9753Eu);
+            feedback |= feedback << 32;
+            for (var i = 0; i < data.Length / 8; i++)
+            {
+                state = PackedMath.AddD(state, 0xCE24F523CE24F523UL) ^ feedback;
+                var input = BitConverter.ToUInt64(data, i * 8);
+                var plain = encrypt ? input : input ^ state;
+                var output = encrypt ? input ^ state : plain;
+                BitConverter.GetBytes(output).CopyTo(data, i * 8);
+                feedback = plain;
+            }
+            return;
+        }
+
+        uint hash = 0x85F532, seed = 0x33F641;
+        for (uint i = 0; i < entry.RawName.Length; i++) { hash += (i & 0xff) * entry.RawName[i]; seed ^= hash; }
+        seed += arcKey ^ (7 * (length & 0xffffff) + length + hash + (hash ^ length ^ 0x8f32dcu));
+        seed = 9 * (seed & 0xffffff);
+        seed ^= 0x453Au;
+        var mt = new QlieMersenneTwister(seed);
+        mt.XorState(keyFile); mt.XorState(gameKey);
+        var table = new ulong[16]; for (var i = 0; i < table.Length; i++) table[i] = mt.Rand64();
+        for (var i = 0; i < 9; i++) mt.Rand();
+        ulong hash64 = mt.Rand64(); uint t2 = mt.Rand() & 0xf;
+        for (var i = 0; i < data.Length / 8; i++)
+        {
+            hash64 = PackedMath.AddD(hash64 ^ table[t2], table[t2]);
+            var input = BitConverter.ToUInt64(data, i * 8);
+            var plain = encrypt ? input : input ^ hash64;
+            var output = encrypt ? input ^ hash64 : plain;
+            BitConverter.GetBytes(output).CopyTo(data, i * 8);
+            hash64 = PackedMath.AddB(hash64, plain) ^ plain;
+            hash64 = PackedMath.AddW(PackedMath.ShiftD(hash64, 1), plain);
+            t2 = (t2 + 1) & 0xf;
+        }
+    }
+}
+
 public static class QlieRepacker
 {
     private const int IndexEntryFixed = 2 + 8 + 4 + 4 + 4 + 4 + 4;
@@ -516,11 +588,12 @@ public static class QlieRepacker
     private const int FooterSize = 0x1c;
 
     public static void Repack(QlieArchive archive, QlieManifest manifest, string inputDir, string outputPath,
-        IEntryPayloadCodec codec, IV3EntryCipher? cipher, byte[]? trailerOverride)
+        IEntryPayloadCodec codec, IV3EntryCipher? cipher, byte[]? trailerOverride, IEntryHashProvider? hashProvider = null)
     {
         if (!Directory.Exists(inputDir)) throw new DirectoryNotFoundException($"input directory not found: {inputDir}");
         if (manifest.Entries.Count != archive.Entries.Count) throw new InvalidDataException("manifest entry count does not match source archive");
         var byIndex = manifest.Entries.ToDictionary(x => x.Index);
+        hashProvider ??= new PreserveSourceEntryHashProvider();
         var items = new List<QlieRepackItem>(archive.Entries.Count);
         foreach (var source in archive.Entries)
         {
@@ -538,6 +611,8 @@ public static class QlieRepacker
                 continue;
             }
             if (!row.Decoded) throw new UnsupportedEncryptedRewriteException($"entry {source.Index} is undecoded raw data; edited .qlie-raw entries are rejected (encryption={source.Encryption}, offset=0x{source.Offset:X})");
+            if (source.Name.IndexOf("pack_keyfile", StringComparison.OrdinalIgnoreCase) >= 0)
+                throw new UnsupportedEncryptedRewriteException($"entry {source.Index} is the active pack_keyfile; editing it would invalidate the active key chain for entries {source.Index + 1}..{archive.Entries.Count - 1} (offset=0x{source.Offset:X})");
             if (source.Encryption != 0 && cipher == null)
                 throw new UnsupportedEncryptedRewriteException($"entry {source.Index} edited encrypted payload at offset 0x{source.Offset:X}; provide IV3EntryCipher to prove inverse V3 encryption/signature generation");
             var decoded = File.ReadAllBytes(path);
@@ -550,7 +625,7 @@ public static class QlieRepacker
                 encryption = source.Encryption;
             }
             items.Add(new QlieRepackItem { Name=source.Name, Stored=encoded, UnpackedSize=checked((uint)decoded.Length), Packed=packed,
-                Encryption=encryption, Hash=0, RawName=archive.EncodeName(source.Name), Source=source });
+                Encryption=encryption, Hash=hashProvider.ComputeHash(decoded, source), RawName=archive.EncodeName(source.Name), Source=source });
         }
         WriteArchive(archive, items, outputPath, trailerOverride);
     }
@@ -655,4 +730,19 @@ public static class SyntheticFixture
         // Correct table: count byte 255 => skip 128, then count 0 => one mapping for symbol 128; remaining table incomplete. Use one block with 256 identity mappings encoded as 127?
         m.SetLength(0); m.Write(BitConverter.GetBytes(0xff435031u));m.WriteByte(0);m.WriteByte(0);m.WriteByte(0);m.WriteByte(0);m.Write(BitConverter.GetBytes(body.Length));m.WriteByte(127); for(var i=0;i<128;i++)m.WriteByte((byte)i); m.WriteByte(127); for(var i=128;i<256;i++)m.WriteByte((byte)i); m.Write(BitConverter.GetBytes(body.Length)); m.Write(body); return m.ToArray();}
     private static byte[] EncodeName(string name,uint arc){var b=Encoding.GetEncoding(932).GetBytes(name);var key=unchecked(b.Length+(unchecked((int)arc)^0x3E));for(var k=0;k<b.Length;k++)b[k]^=unchecked((byte)(((k+1)^key)+(k+1)));return b;}
+    public static readonly byte[] EncryptedPlain = Enumerable.Range(0, 32).Select(i => (byte)(0x40 + i)).ToArray();
+    public static void CreateEncrypted(string path, string keyPath, string gameKeyPath)
+    {
+        var key = Enumerable.Range(0, 32).Select(i => (byte)(i + 1)).ToArray();
+        var game = Enumerable.Range(0, 48).Select(i => (byte)(0xa0 + i)).ToArray();
+        File.WriteAllBytes(keyPath, key); File.WriteAllBytes(gameKeyPath, game);
+        var name = "cipher.bin"; var raw = EncodeName(name, 0);
+        var entry = new QlieEntry { Index=0, Name=name, RawName=raw, Encryption=4, KeyFile=key, GameKeyData=game };
+        var stored = EncryptedPlain.ToArray(); QlieV3EntryCipher.Transform(stored, entry, 0, key, game, true);
+        using var f = new FileStream(path, FileMode.CreateNew, FileAccess.Write, FileShare.None);
+        f.Write(stored); var indexOffset = f.Position;
+        f.Write(BitConverter.GetBytes((ushort)raw.Length)); f.Write(raw); f.Write(BitConverter.GetBytes(0L)); f.Write(BitConverter.GetBytes((uint)stored.Length)); f.Write(BitConverter.GetBytes((uint)EncryptedPlain.Length)); f.Write(BitConverter.GetBytes(0)); f.Write(BitConverter.GetBytes(4)); f.Write(BitConverter.GetBytes(0u));
+        f.Write(new byte[0x400]); f.Write(Encoding.ASCII.GetBytes("FilePackVer3.0")); f.Write(new byte[2]); f.Write(BitConverter.GetBytes(1)); f.Write(BitConverter.GetBytes(indexOffset));
+    }
+
 }

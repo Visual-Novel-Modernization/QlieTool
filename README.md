@@ -26,9 +26,10 @@ repack rebuilds a new archive; it never copies the source archive as the output.
 - Unchanged extracted files reuse their original stored payload bytes and original packed/encryption/hash metadata.
 - Changed decoded files are emitted as new literal, unpacked payloads with recalculated stored/unpacked sizes and a regenerated encrypted CP932 name. The built-in codec intentionally does not implement 1PC compression.
 - Changed raw .qlie-raw entries are rejected because their decoded representation is unknown.
-- Changed encrypted entries are rejected unless an IV3EntryCipher implementation is injected; the exception reports the entry offset. This avoids inventing an encryption/signature algorithm.
-- The 0x400-byte trailer occupies output EOF-0x41c through EOF-0x1c; its first 0x100 bytes are the ArcKey material used for name encryption. The opaque trailer is preserved byte-for-byte unless a caller supplies a validated replacement through the API. GARbro exposes no V3 writer, and the V3 entry Hash field is preserved for unchanged entries and set to zero for newly literal entries because its writer semantics are not established.
-- Payload encoding is injectable through `IEntryPayloadCodec.Encode(byte[] decoded, QlieEntry sourceEntry)`. V3 encryption/signature generation is injectable through `IV3EntryCipher.Encrypt(byte[] plainPayload, QlieEntry sourceEntry, string entryName)`. The CLI currently uses `PlainEntryPayloadCodec` and no cipher; encrypted edits therefore fail closed.
+- Changed encryption!=0 entries use the built-in `QlieV3EntryCipher`, which is the inverse of the GARbro reader's per-block XOR/state transform. Changed decoded payloads are emitted as literal (`packed=false`), retain the source encryption mode, and are decrypted again by the reader in the synthetic roundtrip test. The transform processes complete 64-bit blocks exactly as the reader does; a tail shorter than 8 bytes is preserved byte-for-byte, matching the reader.
+- The active `pack_keyfile` entry is rejected when edited because changing it would invalidate the active key chain used by all following entries. Ordinary encrypted entries use their recorded active key.
+- The 0x400-byte trailer occupies output EOF-0x41c through EOF-0x1c; its first 0x100 bytes are the ArcKey material used for name encryption. The opaque trailer is preserved byte-for-byte unless a caller supplies a validated replacement through the API. `IEntryHashProvider` is an explicit injection point; the CLI uses `PreserveSourceEntryHashProvider` because GARbro reads the V3 entry Hash but does not establish its writer algorithm, so changed entries retain the source Hash rather than receiving a guessed value.
+- Payload encoding is injectable through `IEntryPayloadCodec.Encode(byte[] decoded, QlieEntry sourceEntry)`. V3 encryption is injectable through `IV3EntryCipher.Encrypt(byte[] plainPayload, QlieEntry sourceEntry, string entryName)` and the CLI supplies the built-in `QlieV3EntryCipher`.
 
 clone remains a compatibility alias for the same rebuild operation; it is not a byte-copy command. Output must be a new path and must not point into an installed game directory.
 
@@ -39,11 +40,11 @@ dotnet build QlieTool.csproj
 dotnet run -- self-test
 ```
 
-The synthetic test covers FilePackVer3.0 index parsing, CP932 name cipher, 1PC decoding, modified plain payload, unchanged stored-payload reuse, path guards, and rejection of edited raw payloads.
+The synthetic test covers FilePackVer3.0 index parsing, CP932 name cipher, 1PC decoding, modified plain payload, unchanged stored-payload reuse, the built-in encryption=4 inverse cipher, encrypted decode/modify/repack/readback, path guards, and rejection of edited raw payloads.
 
 ## Tested scope and limitations
 
-On a TEMP copy of the target data0.pack, list read 9 entries at index offset 0x284F4. Extract and verify completed: 2 entries decoded and 7 retained as exact stored payloads with the .qlie-raw suffix. The seven raw entry payload hashes matched the corresponding source ranges. An unchanged rebuilt archive preserves every stored payload, while its regenerated layout/footer is not required to be byte-equal to the source; modified repack is validated by the synthetic fixture. The seven raw entries are not claimed to be decoded, and encrypted edits require an injected cipher. Other packs/games have not been validated.
+On a TEMP copy of the target second-game data2.pack, list/extract/verify completed for 1,036 entries: all 1,036 decoded, all use encryption=4, and none are packed. The encrypted file chara/motion/motion01.b was edited, rebuilt, verified, extracted again, and read back with the changed first byte matching. Editing the active pack_keyfile_kfueheish15538fa9or.key is rejected because it would invalidate the active key chain. An earlier data0 probe retained seven unsupported entries exactly with the .qlie-raw suffix; other packs/games have not been validated.
 
 Archive payloads above the current in-memory decrypt/decompress limit are reported as unsupported; list and bounded raw payload reads use 64-bit offsets. All real archive/key inputs are copied into a unique Windows TEMP directory by the CLI before reading. The repacker writes only to the requested new output path.
 

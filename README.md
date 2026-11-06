@@ -1,6 +1,6 @@
 # QlieTool
 
-Independent .NET 8 console utility for inspecting and rebuilding QLIE FilePackVer3.0 archives. The implementation follows the QLIE reader behavior in GARbro and is tested against a TEMP copy of a second Bishoujo Mangekyou game archive.
+Independent .NET 8 console utility for inspecting and rebuilding QLIE FilePackVer3.0 archives. The implementation follows the QLIE reader behavior in GARbro; current regression coverage is synthetic and does not establish compatibility with unverified game archives.
 
 ## Commands
 
@@ -21,10 +21,10 @@ verify parses each entry, attempts decoding, checks unpacked size for decoded en
 
 ## Modified repack behavior
 
-repack rebuilds a new archive; it never copies the source archive as the output. It reads every manifest entry from --input-dir, validates the manifest source SHA-256, and writes payloads in the source physical order without adding per-entry alignment, preserves the source IndexOffset, copies the complete source index-to-trailer HashVer1.3 region byte-for-byte, preserves the 0x400-byte V3 trailer, and writes a FilePackVer3.0 footer with the source index offset.
+repack rebuilds a new archive; it never copies the source archive as the output. It reads every manifest entry from --input-dir, validates the manifest source SHA-256, and writes payloads in the source physical order without adding per-entry alignment, preserves the source IndexOffset, copies the complete opaque index-to-trailer gap byte-for-byte, preserves the 0x400-byte V3 trailer, and writes a FilePackVer3.0 footer with the source index offset. The gap is preserved conservatively; its writer semantics and any entry-hash update algorithm are not established by the public reader references.
 
 - Unchanged extracted files reuse their original stored payload bytes and original packed/encryption/hash metadata.
-- Changed decoded files are emitted as new literal, unpacked payloads. The built-in codec intentionally does not implement 1PC compression; packed entries are rejected for edits rather than being mislabeled as packed=false. To preserve the source HashVer1.3 region and all later offsets, edited stored payloads must remain exactly the source StoredSize; size-changing edits are rejected conservatively.
+- Changed decoded files are emitted as new literal, unpacked payloads. The built-in codec intentionally does not implement 1PC compression; packed entries are rejected for edits rather than being mislabeled as packed=false. To preserve the opaque index-to-trailer region and all later offsets, edited stored payloads must remain exactly the source StoredSize; size-changing edits are rejected conservatively. Preserving that region is not HashVer validation or hash regeneration.
 - Changed raw .qlie-raw entries are rejected because their decoded representation is unknown.
 - Changed encryption!=0 entries use the built-in `QlieV3EntryCipher`, which is the inverse of the GARbro reader's per-block XOR/state transform. Changed decoded payloads are emitted as literal (`packed=false`), retain the source encryption mode, and are decrypted again by the reader in the synthetic roundtrip test. The transform processes complete 64-bit blocks exactly as the reader does; a tail shorter than 8 bytes is preserved byte-for-byte, matching the reader.
 - The active `pack_keyfile` entry is rejected when edited because changing it would invalidate the active key chain used by all following entries. Ordinary encrypted entries use their recorded active key.
@@ -44,7 +44,7 @@ The synthetic test covers FilePackVer3.0 index parsing, CP932 name cipher, 1PC d
 
 ## Tested scope and limitations
 
-On a TEMP copy of the target second-game data2.pack, list/extract/verify completed for 1,036 entries: all 1,036 decoded, all use encryption=4, and none are packed. The encrypted file chara/motion/motion01.b was edited, rebuilt, verified, extracted again, and read back with the changed first byte matching. Editing the active pack_keyfile_kfueheish15538fa9or.key is rejected because it would invalidate the active key chain. An earlier data0 probe retained seven unsupported entries exactly with the .qlie-raw suffix; other packs/games have not been validated.
+Validation covers the synthetic fixtures and regression self-test, plus a complete TEMP-only edit/repack/readback check on the target second-game data2.pack using DLL/key.fkey: verify decoded 1,036/1,036 entries, edit `chara\motion\motion01.b` without changing its 20,814-byte stored size, rebuild a same-size 311,421,915-byte archive, verify 1,036/1,036 entries again, and confirm the extracted readback SHA-256 matches the edited file. Entry-hash/signature regeneration remains unverified. The opaque index-to-trailer gap (including HashVer1.3-related bytes) and the 0x400-byte trailer are preserved byte-for-byte; the writer does not regenerate their unknown semantics.
 
 Archive payloads above the current in-memory decrypt/decompress limit are reported as unsupported; list and bounded raw payload reads use 64-bit offsets. All real archive/key inputs are copied into a unique Windows TEMP directory by the CLI before reading. The repacker writes only to the requested new output path.
 

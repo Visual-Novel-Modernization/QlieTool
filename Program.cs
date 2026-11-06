@@ -60,16 +60,16 @@ public static class Program
     private static int RunExtract(string[] args)
     {
         Require(args, 3);
-        var output = Path.GetFullPath(args[2]);
-        Directory.CreateDirectory(output);
+        var output = PathGuards.EnsureDirectoryTree(args[2]);
         using var input = TempInput.CopyArchive(args[1], FindOption(args, "--key"), FindOption(args, "--game-key"));
         using var archive = QlieArchive.Open(input.ArchivePath, input.KeyPath, input.GameKeyPath);
         var rows = new List<ManifestEntry>();
         foreach (var e in archive.Entries)
         {
             var destination = SafeDestination(output, e.Name);
+            PathGuards.EnsureDirectoryTree(Path.GetDirectoryName(destination)!);
+            PathGuards.EnsureNoReparseComponents(destination);
             if (File.Exists(destination)) throw new IOException($"refusing to overwrite {destination}");
-            Directory.CreateDirectory(Path.GetDirectoryName(destination)!);
             var decoded = true;
             Stream source;
             try { source = archive.OpenDecoded(e); }
@@ -77,6 +77,8 @@ public static class Program
             {
                 decoded = false;
                 destination = SafeDestination(output, e.Name + ".qlie-raw");
+                PathGuards.EnsureDirectoryTree(Path.GetDirectoryName(destination)!);
+                PathGuards.EnsureNoReparseComponents(destination);
                 if (File.Exists(destination)) throw new IOException($"refusing to overwrite {destination}");
                 source = archive.OpenStored(e);
             }
@@ -89,6 +91,8 @@ public static class Program
         }
         var manifestPath = FindOption(args, "--manifest") ?? Path.Combine(output, "qlie-manifest.json");
         manifestPath = Path.GetFullPath(manifestPath);
+        PathGuards.EnsureDirectoryTree(Path.GetDirectoryName(manifestPath)!);
+        PathGuards.EnsureNoReparseComponents(manifestPath);
         if (File.Exists(manifestPath)) throw new IOException($"refusing to overwrite {manifestPath}");
         var manifest = archive.CreateManifest(rows, Path.GetFileName(args[1]));
         File.WriteAllText(manifestPath, JsonSerializer.Serialize(manifest, JsonOptions), new UTF8Encoding(false));
@@ -121,7 +125,7 @@ public static class Program
                 _ = SHA256.HashData(stream);
                 if (decoded)
                 {
-                    if (e.UnpackedSize != 0 && e.UnpackedSize != length)
+                    if ((ulong)length != e.UnpackedSize)
                         throw new InvalidDataException($"entry {e.Index} unpacked size mismatch: expected {e.UnpackedSize}, got {length}");
                     decodedEntries++;
                 }
@@ -137,7 +141,9 @@ public static class Program
     {
         Require(args, 3);
         var manifestPath = Path.GetFullPath(args[1]);
+        PathGuards.EnsureNoReparseComponents(manifestPath, false);
         var output = Path.GetFullPath(args[2]);
+        PathGuards.EnsureNoReparseComponents(output);
         var source = FindOption(args, "--source") ?? throw new ArgumentException("repack requires --source <original.pack>");
         var inputDir = FindOption(args, "--input-dir") ?? throw new ArgumentException("repack requires --input-dir <extracted-dir>");
         source = Path.GetFullPath(source);
@@ -147,7 +153,6 @@ public static class Program
         var manifest = JsonSerializer.Deserialize<QlieManifest>(File.ReadAllText(manifestPath), JsonOptions)
             ?? throw new InvalidDataException("invalid manifest");
         if (manifest.Format != "QLIE" || manifest.Version != "3.0") throw new InvalidDataException("manifest is not a QLIE V3.0 manifest");
-        Directory.CreateDirectory(Path.GetDirectoryName(output)!);
         // Copy source and key material into one unique TEMP staging directory before any hash/read.
         using var input = TempInput.CopyArchive(source, FindOption(args, "--key"), FindOption(args, "--game-key"));
         if (!string.Equals(Sha256File(input.ArchivePath), manifest.SourceSha256, StringComparison.OrdinalIgnoreCase))
@@ -255,6 +260,61 @@ public static class Program
     internal static readonly JsonSerializerOptions JsonOptions = new() { WriteIndented = true, PropertyNamingPolicy = JsonNamingPolicy.CamelCase };
 }
 
+internal static class PathGuards
+{
+    public static string EnsureDirectoryTree(string path)
+    {
+        var full = Path.GetFullPath(path);
+        var root = Path.GetPathRoot(full) ?? throw new InvalidDataException($"path has no root: {path}");
+        var current = root;
+        foreach (var part in full[root.Length..].Split(new[] { Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar }, StringSplitOptions.RemoveEmptyEntries))
+        {
+            current = Path.Combine(current, part);
+            if (TryGetAttributes(current, out var attrs))
+            {
+                if ((attrs & FileAttributes.ReparsePoint) != 0)
+                    throw new InvalidDataException($"reparse point is not allowed in path: {current}");
+                if (!Directory.Exists(current))
+                    throw new IOException($"path component is not a directory: {current}");
+            }
+            else
+            {
+                Directory.CreateDirectory(current);
+                if (TryGetAttributes(current, out attrs) && (attrs & FileAttributes.ReparsePoint) != 0)
+                    throw new InvalidDataException($"reparse point is not allowed in path: {current}");
+            }
+        }
+        return full;
+    }
+
+    public static void EnsureNoReparseComponents(string path, bool allowMissingLeaf = true)
+    {
+        var full = Path.GetFullPath(path);
+        var root = Path.GetPathRoot(full) ?? throw new InvalidDataException($"path has no root: {path}");
+        var current = root;
+        var parts = full[root.Length..].Split(new[] { Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar }, StringSplitOptions.RemoveEmptyEntries);
+        for (var i = 0; i < parts.Length; i++)
+        {
+            current = Path.Combine(current, parts[i]);
+            if (!TryGetAttributes(current, out var attrs))
+            {
+                if (i == parts.Length - 1 && allowMissingLeaf) return;
+                return;
+            }
+            if ((attrs & FileAttributes.ReparsePoint) != 0)
+                throw new InvalidDataException($"reparse point is not allowed in path: {current}");
+        }
+    }
+
+    private static bool TryGetAttributes(string path, out FileAttributes attrs)
+    {
+        try { attrs = File.GetAttributes(path); return true; }
+        catch (FileNotFoundException) { attrs = default; return false; }
+        catch (DirectoryNotFoundException) { attrs = default; return false; }
+        catch (IOException) { attrs = default; return false; }
+    }
+}
+
 public sealed class TempInput : IDisposable
 {
     public string ArchivePath { get; }
@@ -264,22 +324,59 @@ public sealed class TempInput : IDisposable
     private TempInput(string archive, string? key, string? gameKey, string d) { ArchivePath = archive; KeyPath = key; GameKeyPath = gameKey; dir = d; }
     public static TempInput CopyArchive(string archive, string? key, string? gameKey)
     {
-        archive = Path.GetFullPath(archive); if (!File.Exists(archive)) throw new FileNotFoundException("archive", archive);
-        var d = Path.Combine(Path.GetTempPath(), "QlieTool-" + Guid.NewGuid().ToString("N")); Directory.CreateDirectory(d);
-        var a = Path.Combine(d, Path.GetFileName(archive)); File.Copy(archive, a);
-        string? k = null;
-        if (key == null) {
-            var candidates = new[] { Path.Combine(Path.GetDirectoryName(archive)!, "key.fkey"), Path.Combine(Path.GetDirectoryName(archive)!, "DLL", "key.fkey"), Path.Combine(Path.GetDirectoryName(archive)!, "..", "DLL", "key.fkey") };
-            key = candidates.FirstOrDefault(File.Exists);
-        }
-        if (key != null)
+        archive = Path.GetFullPath(archive);
+        if (!File.Exists(archive)) throw new FileNotFoundException("archive", archive);
+        PathGuards.EnsureNoReparseComponents(archive, false);
+        var d = Path.Combine(Path.GetTempPath(), "QlieTool-" + Guid.NewGuid().ToString("N"));
+        Directory.CreateDirectory(d);
+        try
         {
-            if (!File.Exists(key)) throw new FileNotFoundException("key", key);
-            k = Path.Combine(d, "key.fkey"); File.Copy(Path.GetFullPath(key), k);
+            var a = Path.Combine(d, Path.GetFileName(archive));
+            File.Copy(archive, a);
+            if (key == null)
+            {
+                var candidates = new[]
+                {
+                    Path.Combine(Path.GetDirectoryName(archive)!, "key.fkey"),
+                    Path.Combine(Path.GetDirectoryName(archive)!, "DLL", "key.fkey"),
+                    Path.Combine(Path.GetDirectoryName(archive)!, "..", "DLL", "key.fkey")
+                };
+                key = candidates.FirstOrDefault(File.Exists);
+            }
+            if (key != null)
+            {
+                key = Path.GetFullPath(key);
+                if (!File.Exists(key)) throw new FileNotFoundException("key", key);
+                PathGuards.EnsureNoReparseComponents(key, false);
+                var k = Path.Combine(d, "key.fkey");
+                File.Copy(key, k);
+                string? g = null;
+                if (gameKey != null)
+                {
+                    gameKey = Path.GetFullPath(gameKey);
+                    if (!File.Exists(gameKey)) throw new FileNotFoundException("game key", gameKey);
+                    PathGuards.EnsureNoReparseComponents(gameKey, false);
+                    g = Path.Combine(d, "game.keydata");
+                    File.Copy(gameKey, g);
+                }
+                return new TempInput(a, k, g, d);
+            }
+            string? gameCopy = null;
+            if (gameKey != null)
+            {
+                gameKey = Path.GetFullPath(gameKey);
+                if (!File.Exists(gameKey)) throw new FileNotFoundException("game key", gameKey);
+                PathGuards.EnsureNoReparseComponents(gameKey, false);
+                gameCopy = Path.Combine(d, "game.keydata");
+                File.Copy(gameKey, gameCopy);
+            }
+            return new TempInput(a, null, gameCopy, d);
         }
-        string? g = null;
-        if (gameKey != null && File.Exists(gameKey)) { g = Path.Combine(d, "game.keydata"); File.Copy(Path.GetFullPath(gameKey), g); }
-        return new TempInput(a, k, g, d);
+        catch
+        {
+            try { Directory.Delete(d, true); } catch { }
+            throw;
+        }
     }
     public void Dispose() { try { Directory.Delete(dir, true); } catch { } }
 }
@@ -288,7 +385,8 @@ public sealed class QlieEntry
 {
     public int Index { get; init; }
     public string Name { get; init; } = "";
-    public byte[] RawName { get; init; } = Array.Empty<byte>();
+    // CipherNameBytes is the exact byte sequence stored in the index; ClearNameBytes is decrypted CP932.
+    public byte[] CipherNameBytes { get; init; } = Array.Empty<byte>();
     public byte[] ClearNameBytes { get; init; } = Array.Empty<byte>();
     public long Offset { get; init; }
     public uint StoredSize { get; init; }
@@ -339,6 +437,7 @@ public sealed class QlieArchive : IDisposable
     public int VersionMinor { get; }
     public string Version => $"{VersionMajor}.{VersionMinor}";
     public long IndexOffset { get; }
+    public long FileLength => file.Length;
     public long IndexEnd { get; private set; }
     public List<QlieEntry> Entries { get; } = new();
     private readonly uint arcKey;
@@ -391,8 +490,18 @@ public sealed class QlieArchive : IDisposable
             if (major != 3 || minor != 0) throw new NotSupportedException($"FilePackVer{major}.{minor}: this tool targets V3.0");
             if (count < 0 || count > 10_000_000 || index < 0 || index >= trailerAt) throw new InvalidDataException("invalid QLIE index metadata");
             var arcBytes = trailer.AsSpan(0, 0x100).ToArray(); var arc = CalculateArcKey(arcBytes);
-            byte[]? key = keyPath != null && File.Exists(keyPath) ? File.ReadAllBytes(keyPath) : null;
-            byte[]? gameKey = gameKeyPath != null && File.Exists(gameKeyPath) ? File.ReadAllBytes(gameKeyPath) : null;
+            byte[]? key = null;
+            if (keyPath != null)
+            {
+                if (!File.Exists(keyPath)) throw new FileNotFoundException("key", keyPath);
+                key = File.ReadAllBytes(keyPath);
+            }
+            byte[]? gameKey = null;
+            if (gameKeyPath != null)
+            {
+                if (!File.Exists(gameKeyPath)) throw new FileNotFoundException("game key", gameKeyPath);
+                gameKey = File.ReadAllBytes(gameKeyPath);
+            }
             var a = new QlieArchive(f, key, gameKey, major, minor, index, arc, trailer, trailerAt);
             a.ReadEntries(count, footer); return a;
         }
@@ -403,22 +512,25 @@ public sealed class QlieArchive : IDisposable
     {
         file.Position = IndexOffset;
         byte[]? activeKey = keyFile;
+        var readPackKeyfile = false;
         for (var i = 0; i < count; i++)
         {
             var n = ReadUInt16(file); if (n > 0x100) throw new InvalidDataException($"entry {i}: invalid name length {n}");
             var raw = ReadExactly(file, n); var nameBytes = raw.ToArray(); DecryptName(nameBytes, n);
             var name = cp932.GetString(nameBytes);
             var offset = ReadInt64(file); var stored = ReadUInt32(file); var unpacked = ReadUInt32(file); var packed = ReadInt32(file) != 0; var enc = ReadInt32(file); var hash = ReadUInt32(file);
-            if (offset < 0 || offset > file.Length - stored || offset >= IndexOffset) throw new InvalidDataException($"entry {i}: invalid placement");
-            var entry = new QlieEntry { Index=i, Name=name, RawName=raw, ClearNameBytes=nameBytes, Offset=offset, StoredSize=stored, UnpackedSize=unpacked, Packed=packed, Encryption=enc, Hash=hash, KeyFile=activeKey, GameKeyData=gameKeyData };
+            if (offset < 0 || offset >= IndexOffset || stored > (ulong)(IndexOffset - offset) || offset > file.Length - stored)
+                throw new InvalidDataException($"entry {i}: invalid placement");
+            var entry = new QlieEntry { Index=i, Name=name, CipherNameBytes=raw.ToArray(), ClearNameBytes=nameBytes, Offset=offset, StoredSize=stored, UnpackedSize=unpacked, Packed=packed, Encryption=enc, Hash=hash, KeyFile=activeKey, GameKeyData=gameKeyData };
             Entries.Add(entry);
             if (file.Position > trailerStart) throw new InvalidDataException("QLIE index overlaps the 0x400-byte V3 trailer block");
             var nextIndex = file.Position;
-            if (activeKey != null && name.IndexOf("pack_keyfile", StringComparison.OrdinalIgnoreCase) >= 0)
+            if (!readPackKeyfile && activeKey != null && name.IndexOf("pack_keyfile", StringComparison.OrdinalIgnoreCase) >= 0)
             {
+                readPackKeyfile = true;
                 var payload = ReadRawPayload(entry);
                 if (entry.Encryption != 0) DecryptEntry(payload, entry, activeKey, gameKeyData);
-                if (entry.Packed) payload = Decompress1Pc(payload) ?? throw new InvalidDataException($"entry {i}: invalid embedded key payload");
+                if (entry.Packed) payload = Decompress1Pc(payload, entry.UnpackedSize) ?? throw new InvalidDataException($"entry {i}: invalid embedded key payload");
                 activeKey = payload;
             }
             file.Position = nextIndex;
@@ -458,8 +570,10 @@ public sealed class QlieArchive : IDisposable
         }
         if (e.Packed)
         {
-            var decoded = Decompress1Pc(data); if (decoded == null) throw new InvalidDataException($"entry {e.Index}: unsupported or invalid 1PC payload"); data = decoded;
+            var decoded = Decompress1Pc(data, e.UnpackedSize); if (decoded == null) throw new InvalidDataException($"entry {e.Index}: unsupported or invalid 1PC payload"); data = decoded;
         }
+        if ((ulong)data.LongLength != e.UnpackedSize)
+            throw new InvalidDataException($"entry {e.Index} unpacked size mismatch: expected {e.UnpackedSize}, got {data.LongLength}");
         return new MemoryStream(data, writable:false);
     }
 
@@ -467,7 +581,7 @@ public sealed class QlieArchive : IDisposable
     {
         string dh; using (var stream = decoded ? OpenDecoded(e) : OpenStored(e)) dh = Convert.ToHexString(SHA256.HashData(stream)).ToLowerInvariant();
         file.Position=e.Offset; using var limited = new LimitedStream(file,e.StoredSize); var ph=Convert.ToHexString(SHA256.HashData(limited)).ToLowerInvariant();
-        return new ManifestEntry { Index=e.Index, Name=e.Name, RawNameBase64=Convert.ToBase64String(e.RawName), Offset=e.Offset, StoredSize=e.StoredSize, UnpackedSize=e.UnpackedSize, Packed=e.Packed, Encryption=e.Encryption, Hash=e.Hash, PayloadSha256=ph, ExtractedSha256=dh, Decoded=decoded };
+        return new ManifestEntry { Index=e.Index, Name=e.Name, RawNameBase64=Convert.ToBase64String(e.CipherNameBytes), Offset=e.Offset, StoredSize=e.StoredSize, UnpackedSize=e.UnpackedSize, Packed=e.Packed, Encryption=e.Encryption, Hash=e.Hash, PayloadSha256=ph, ExtractedSha256=dh, Decoded=decoded };
     }
     public QlieManifest CreateManifest(List<ManifestEntry> rows, string sourceName)
     { return new QlieManifest { Version=Version, Count=Entries.Count, IndexOffset=IndexOffset, ArchiveLength=file.Length, SourceName=sourceName, SourceSha256=HashArchive(), Entries=rows }; }
@@ -493,10 +607,75 @@ public sealed class QlieArchive : IDisposable
     private static uint ReadUInt32(Stream s)=>BitConverter.ToUInt32(ReadExactly(s,4));
     private static uint CalculateArcKey(byte[] data)
     { ulong hash=0,key=0; for(var i=0;i+8<=data.Length;i+=8){hash=PackedMath.AddW(hash,0x0307030703070307);key=PackedMath.AddW(key,BitConverter.ToUInt64(data,i)^hash);} return (uint)(key^(key>>32))&0x0fffffff; }
-    public static byte[]? Decompress1Pc(byte[] input)
+    public static byte[]? Decompress1Pc(byte[] input, uint expectedSize)
     {
-        if(input.Length<12||BitConverter.ToUInt32(input,0)!=0xff435031)return null; var is16=(input[4]&1)!=0; var outputLength=BitConverter.ToInt32(input,8); if(outputLength<0)return null; var output=new byte[outputLength]; var node0=new byte[256];var node1=new byte[256];var child=new byte[256];var src=12;var dst=0;
-        try { while(src<input.Length){for(var i=0;i<256;i++)node0[i]=(byte)i;var i2=0;while(i2<256){var count=input[src++];if(count>127){i2+=count-127;count=0;}if(i2>255)break;count++;for(var k=0;k<count;k++){node0[i2]=input[src++];if(node0[i2]!=i2)node1[i2]=input[src++];i2++;}}var count2=is16?BitConverter.ToUInt16(input,src):BitConverter.ToInt32(input,src);src+=is16?2:4;var stack=0;while(true){int idx;if(stack>0)idx=child[--stack];else{if(count2==0)break;count2--;if(src>=input.Length)throw new InvalidDataException();idx=input[src++];}if(node0[idx]==idx){if(dst>=output.Length)throw new InvalidDataException();output[dst++]=(byte)idx;}else{if(stack+2>child.Length)throw new InvalidDataException();child[stack++]=node1[idx];child[stack++]=node0[idx];}}} } catch(IndexOutOfRangeException){return null;} if(dst!=output.Length)return null; return output;
+        const int maxOutput = 256 * 1024 * 1024;
+        if (input.Length < 12 || BitConverter.ToUInt32(input, 0) != 0xff435031)
+            throw new InvalidDataException("invalid 1PC header");
+        if (expectedSize > maxOutput)
+            throw new InvalidDataException($"1PC output exceeds supported limit: {expectedSize}");
+        var is16 = (input[4] & 1) != 0;
+        var outputLength = BitConverter.ToInt32(input, 8);
+        if (outputLength < 0 || (uint)outputLength != expectedSize || outputLength > maxOutput)
+            throw new InvalidDataException($"invalid 1PC output length: header={outputLength}, expected={expectedSize}");
+        var output = new byte[outputLength];
+        var node0 = new byte[256]; var node1 = new byte[256]; var child = new byte[256];
+        var src = 12; var dst = 0;
+        void Need(int length)
+        {
+            if (length < 0 || src > input.Length - length) throw new InvalidDataException("truncated 1PC input");
+        }
+        try
+        {
+            while (src < input.Length)
+            {
+                for (var i = 0; i < 256; i++) node0[i] = (byte)i;
+                var i2 = 0;
+                while (i2 < 256)
+                {
+                    Need(1);
+                    var count = input[src++];
+                    if (count > 127) { i2 += count - 127; count = 0; }
+                    if (i2 > 255) break;
+                    count++;
+                    for (var k = 0; k < count; k++)
+                    {
+                        Need(1); node0[i2] = input[src++];
+                        if (node0[i2] != i2) { Need(1); node1[i2] = input[src++]; }
+                        i2++;
+                    }
+                }
+                Need(is16 ? 2 : 4);
+                var count2 = is16 ? BitConverter.ToUInt16(input, src) : BitConverter.ToInt32(input, src);
+                src += is16 ? 2 : 4;
+                if (count2 < 0) throw new InvalidDataException("negative 1PC symbol count");
+                var stack = 0;
+                while (true)
+                {
+                    int idx;
+                    if (stack > 0) idx = child[--stack];
+                    else
+                    {
+                        if (count2 == 0) break;
+                        count2--; Need(1); idx = input[src++];
+                    }
+                    if (node0[idx] == idx)
+                    {
+                        if (dst >= output.Length) throw new InvalidDataException("1PC output exceeds declared length");
+                        output[dst++] = (byte)idx;
+                    }
+                    else
+                    {
+                        if (stack + 2 > child.Length) throw new InvalidDataException("1PC Huffman stack overflow");
+                        child[stack++] = node1[idx]; child[stack++] = node0[idx];
+                    }
+                }
+            }
+        }
+        catch (IndexOutOfRangeException ex) { throw new InvalidDataException("invalid 1PC table or symbol", ex); }
+        catch (ArgumentOutOfRangeException ex) { throw new InvalidDataException("truncated 1PC input", ex); }
+        if (dst != output.Length) throw new InvalidDataException($"1PC output size mismatch: expected {output.Length}, got {dst}");
+        return output;
     }
 }
 
@@ -540,7 +719,7 @@ public sealed class QlieRepackItem
     public required bool Packed { get; init; }
     public required int Encryption { get; init; }
     public required uint Hash { get; init; }
-    public required byte[] RawName { get; init; }
+    public required byte[] CipherNameBytes { get; init; } // exact ciphertext bytes for index writeback
     public required QlieEntry Source { get; init; }
 }
 
@@ -582,7 +761,8 @@ public sealed class QlieV3EntryCipher : IV3EntryCipher
         }
 
         uint hash = 0x85F532, seed = 0x33F641;
-        for (uint i = 0; i < entry.RawName.Length; i++) { hash += (i & 0xff) * entry.RawName[i]; seed ^= hash; }
+        var seedName = entry.ClearNameBytes.Length != 0 ? entry.ClearNameBytes : Encoding.GetEncoding(932).GetBytes(entry.Name);
+        for (uint i = 0; i < seedName.Length; i++) { hash += (i & 0xff) * seedName[i]; seed ^= hash; }
         seed += arcKey ^ (7 * (length & 0xffffff) + length + hash + (hash ^ length ^ 0x8f32dcu));
         seed = 9 * (seed & 0xffffff);
         seed ^= 0x453Au;
@@ -616,7 +796,11 @@ public static class QlieRepacker
         IEntryPayloadCodec codec, IV3EntryCipher? cipher, byte[]? trailerOverride, IEntryHashProvider? hashProvider = null)
     {
         if (!Directory.Exists(inputDir)) throw new DirectoryNotFoundException($"input directory not found: {inputDir}");
-        if (manifest.Entries.Count != archive.Entries.Count) throw new InvalidDataException("manifest entry count does not match source archive");
+        PathGuards.EnsureNoReparseComponents(inputDir, false);
+        if (manifest.Count != archive.Entries.Count || manifest.Entries.Count != archive.Entries.Count)
+            throw new InvalidDataException("manifest entry count does not match source archive");
+        if (manifest.IndexOffset != archive.IndexOffset || manifest.ArchiveLength != archive.FileLength)
+            throw new InvalidDataException("manifest archive metadata does not match source archive");
         var byIndex = manifest.Entries.ToDictionary(x => x.Index);
         hashProvider ??= new PreserveSourceEntryHashProvider();
         var items = new List<QlieRepackItem>(archive.Entries.Count);
@@ -624,6 +808,10 @@ public static class QlieRepacker
         {
             if (!byIndex.TryGetValue(source.Index, out var row) || !string.Equals(row.Name, source.Name, StringComparison.Ordinal))
                 throw new InvalidDataException($"manifest entry {source.Index} does not match source name");
+            if (row.Offset != source.Offset || row.StoredSize != source.StoredSize || row.UnpackedSize != source.UnpackedSize ||
+                row.Packed != source.Packed || row.Encryption != source.Encryption || row.Hash != source.Hash ||
+                !string.Equals(row.RawNameBase64, Convert.ToBase64String(source.CipherNameBytes), StringComparison.Ordinal))
+                throw new InvalidDataException($"manifest entry {source.Index} metadata does not match source archive");
             var rel = string.IsNullOrWhiteSpace(row.ExtractedPath) ? source.Name + (row.Decoded ? "" : ".qlie-raw") : row.ExtractedPath;
             var path = SafeInputPath(inputDir, rel);
             if (!File.Exists(path)) throw new FileNotFoundException($"missing extracted entry {rel}", path);
@@ -632,7 +820,7 @@ public static class QlieRepacker
             if (string.Equals(fileHash, expected, StringComparison.OrdinalIgnoreCase))
             {
                 items.Add(new QlieRepackItem { Name=source.Name, Stored=ReadStored(archive, source), UnpackedSize=source.UnpackedSize,
-                    Packed=source.Packed, Encryption=source.Encryption, Hash=source.Hash, RawName=source.RawName.ToArray(), Source=source });
+                    Packed=source.Packed, Encryption=source.Encryption, Hash=source.Hash, CipherNameBytes=source.CipherNameBytes.ToArray(), Source=source });
                 continue;
             }
             if (!row.Decoded) throw new UnsupportedEncryptedRewriteException($"entry {source.Index} is undecoded raw data; edited .qlie-raw entries are rejected (encryption={source.Encryption}, offset=0x{source.Offset:X})");
@@ -652,12 +840,31 @@ public static class QlieRepacker
                 encryption = source.Encryption;
             }
             items.Add(new QlieRepackItem { Name=source.Name, Stored=encoded, UnpackedSize=checked((uint)decoded.Length), Packed=packed,
-                Encryption=encryption, Hash=hashProvider.ComputeHash(decoded, source), RawName=source.RawName.ToArray(), Source=source });
+                Encryption=encryption, Hash=hashProvider.ComputeHash(decoded, source), CipherNameBytes=source.CipherNameBytes.ToArray(), Source=source });
         }
         WriteArchive(archive, items, outputPath, trailerOverride);
     }
 
     private static void WriteArchive(QlieArchive archive, IReadOnlyList<QlieRepackItem> items, string outputPath, byte[]? trailerOverride)
+    {
+        outputPath = Path.GetFullPath(outputPath);
+        PathGuards.EnsureNoReparseComponents(outputPath);
+        var directory = PathGuards.EnsureDirectoryTree(Path.GetDirectoryName(outputPath)!);
+        if (File.Exists(outputPath)) throw new IOException($"refusing to overwrite {outputPath}");
+        var tempPath = Path.Combine(directory, "." + Path.GetFileName(outputPath) + "." + Guid.NewGuid().ToString("N") + ".tmp");
+        try
+        {
+            WriteArchiveCore(archive, items, tempPath, trailerOverride);
+            PathGuards.EnsureNoReparseComponents(outputPath);
+            File.Move(tempPath, outputPath);
+        }
+        finally
+        {
+            try { if (File.Exists(tempPath)) File.Delete(tempPath); } catch { }
+        }
+    }
+
+    private static void WriteArchiveCore(QlieArchive archive, IReadOnlyList<QlieRepackItem> items, string outputPath, byte[]? trailerOverride)
     {
         if (items.Count != archive.Entries.Count) throw new InvalidDataException("repack item count does not match source archive");
         var offsets = new long[items.Count];
@@ -688,7 +895,7 @@ public static class QlieRepacker
         for (var i = 0; i < items.Count; i++)
         {
             var item = items[i];
-            var name = item.RawName.Length == 0 ? archive.EncodeName(item.Name) : item.RawName;
+            var name = item.CipherNameBytes.Length == 0 ? archive.EncodeName(item.Name) : item.CipherNameBytes;
             if (name.Length > ushort.MaxValue) throw new InvalidDataException($"entry name too long: {item.Name}");
             output.Write(BitConverter.GetBytes((ushort)name.Length));
             output.Write(name, 0, name.Length);
@@ -725,9 +932,11 @@ public static class QlieRepacker
         if (string.IsNullOrWhiteSpace(relative) || Path.IsPathRooted(relative) || relative.Contains(':')) throw new InvalidDataException($"unsafe manifest extracted path: {relative}");
         var normalized = relative.Replace('\\', Path.DirectorySeparatorChar).Replace('/', Path.DirectorySeparatorChar);
         var fullRoot = Path.GetFullPath(root);
+        PathGuards.EnsureNoReparseComponents(fullRoot, false);
         var full = Path.GetFullPath(Path.Combine(fullRoot, normalized));
         var prefix = fullRoot.TrimEnd(Path.DirectorySeparatorChar) + Path.DirectorySeparatorChar;
         if (!full.StartsWith(prefix, StringComparison.OrdinalIgnoreCase)) throw new InvalidDataException($"unsafe manifest extracted path: {relative}");
+        PathGuards.EnsureNoReparseComponents(full, false);
         return full;
     }
 
@@ -781,8 +990,8 @@ public static class SyntheticFixture
         var key = Enumerable.Range(0, 32).Select(i => (byte)(i + 1)).ToArray();
         var game = Enumerable.Range(0, 48).Select(i => (byte)(0xa0 + i)).ToArray();
         File.WriteAllBytes(keyPath, key); File.WriteAllBytes(gameKeyPath, game);
-        var name = "cipher.bin"; var raw = EncodeName(name, 0);
-        var entry = new QlieEntry { Index=0, Name=name, RawName=raw, Encryption=4, KeyFile=key, GameKeyData=game };
+        var name = "cipher.bin"; var clearName = Encoding.GetEncoding(932).GetBytes(name); var raw = EncodeName(name, 0);
+        var entry = new QlieEntry { Index=0, Name=name, CipherNameBytes=raw.ToArray(), ClearNameBytes=clearName, Encryption=4, KeyFile=key, GameKeyData=game };
         var stored = EncryptedPlain.ToArray(); QlieV3EntryCipher.Transform(stored, entry, 0, key, game, true);
         using var f = new FileStream(path, FileMode.CreateNew, FileAccess.Write, FileShare.None);
         f.Write(stored); var indexOffset = f.Position;

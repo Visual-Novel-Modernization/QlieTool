@@ -158,8 +158,9 @@ public static class Program
         if (!string.Equals(Sha256File(input.ArchivePath), manifest.SourceSha256, StringComparison.OrdinalIgnoreCase))
             throw new InvalidDataException("source archive SHA-256 does not match manifest");
         using var archive = QlieArchive.Open(input.ArchivePath, input.KeyPath, input.GameKeyPath);
-        QlieRepacker.Repack(archive, manifest, inputDir, output, new PlainEntryPayloadCodec(), new QlieV3EntryCipher(archive), null);
-        Console.WriteLine($"repacked modified archive: {output} (opaque 0x400-byte trailer preserved; unknown signatures are not regenerated)");
+        QlieRepacker.Repack(archive, manifest, inputDir, output, new QliePayloadCodec(), new QlieV3EntryCipher(archive), null);
+        Console.WriteLine($"repacked modified archive: {output}");
+        Console.WriteLine("HashVer1.3/1PC sections rebuilt; this archive was structurally verified but not launched in the game runtime.");
         return 0;
     }
 
@@ -173,7 +174,7 @@ public static class Program
             SyntheticFixture.Create(archivePath);
             using (var archive = QlieArchive.Open(archivePath, null))
             {
-                if (archive.Entries.Count != 3 || archive.Entries[0].Name != "hello.txt") throw new Exception("synthetic list failed");
+                if (archive.Entries.Count != 4 || archive.Entries[0].Name != "hello.txt") throw new Exception("synthetic list failed");
                 using var decoded = archive.OpenDecoded(archive.Entries[0]);
                 using var sr = new StreamReader(decoded, Encoding.UTF8);
                 if (sr.ReadToEnd() != "hello QLIE") throw new Exception("synthetic extraction failed");
@@ -185,19 +186,35 @@ public static class Program
             var manifestPath = Path.Combine(root, "manifest.json");
             RunExtract(new[] { "extract", archivePath, outDir, "--manifest", manifestPath });
             var roundtrip = Path.Combine(root, "roundtrip.pack");
-            File.WriteAllText(Path.Combine(outDir, "hello.txt"), "hello TEST", new UTF8Encoding(false));
+            File.WriteAllText(Path.Combine(outDir, "hello.txt"), "hello grew beyond original", new UTF8Encoding(false));
+            File.WriteAllText(Path.Combine(outDir, "tail.bin"), "cut", new UTF8Encoding(false));
             RunRepack(new[] { "repack", manifestPath, roundtrip, "--source", archivePath, "--input-dir", outDir });
+            using (var beforeRaw = QlieArchive.Open(archivePath, null))
             using (var rewritten = QlieArchive.Open(roundtrip, null))
             {
-                using var changed = rewritten.OpenDecoded(rewritten.Entries[0]);
-                using var sr = new StreamReader(changed, Encoding.UTF8);
-                if (sr.ReadToEnd() != "hello TEST") throw new Exception("edited payload was not repacked");
-                using var beforeRaw = QlieArchive.Open(archivePath, null);
+                using (var changed = rewritten.OpenDecoded(rewritten.Entries[0]))
+                using (var sr = new StreamReader(changed, Encoding.UTF8))
+                    if (sr.ReadToEnd() != "hello grew beyond original") throw new Exception("grown edited payload was not repacked");
+                using (var shrunk = rewritten.OpenDecoded(rewritten.Entries[3]))
+                using (var sr = new StreamReader(shrunk, Encoding.UTF8))
+                    if (sr.ReadToEnd() != "cut") throw new Exception("shrunken edited payload was not repacked");
+                if (rewritten.IndexOffset == beforeRaw.IndexOffset) throw new Exception("variable-size edits did not relocate index");
+                if (rewritten.Entries[1].Offset == beforeRaw.Entries[1].Offset || rewritten.Entries[3].Offset == beforeRaw.Entries[3].Offset)
+                    throw new Exception("variable-size edits did not relocate later payload offsets");
+                if (rewritten.Entries[0].StoredSize != (uint)Encoding.UTF8.GetByteCount("hello grew beyond original") || rewritten.Entries[3].StoredSize != 3)
+                    throw new Exception("variable-size entry sizes were not serialized");
                 using var oldStored = beforeRaw.OpenStored(beforeRaw.Entries[1]);
                 using var newStored = rewritten.OpenStored(rewritten.Entries[1]);
                 using var oldBytes = new MemoryStream(); using var newBytes = new MemoryStream();
                 oldStored.CopyTo(oldBytes); newStored.CopyTo(newBytes);
                 if (!oldBytes.ToArray().SequenceEqual(newBytes.ToArray())) throw new Exception("unchanged stored payload was not reused");
+                if (!beforeRaw.CopyIndexTrailerGap().SequenceEqual(rewritten.CopyIndexTrailerGap())) throw new Exception("opaque index/trailer gap was not preserved");
+                if (!beforeRaw.CopyTrailerBlock().SequenceEqual(rewritten.CopyTrailerBlock())) throw new Exception("V3 trailer block was not preserved");
+                var oldFooter = beforeRaw.CopyFooter(); var newFooter = rewritten.CopyFooter();
+                if (!oldFooter.AsSpan(0, 0x10).SequenceEqual(newFooter.AsSpan(0, 0x10)) ||
+                    BitConverter.ToInt32(newFooter, 0x10) != rewritten.Entries.Count ||
+                    BitConverter.ToInt64(newFooter, 0x14) != rewritten.IndexOffset)
+                    throw new Exception("rebuilt footer metadata is incorrect");
             }
             File.WriteAllBytes(Path.Combine(outDir, "raw.bin.qlie-raw"), Encoding.ASCII.GetBytes("edited raw"));
             try
@@ -230,7 +247,36 @@ public static class Program
                 after.CopyTo(afterMs);
                 if (!afterMs.ToArray().SequenceEqual(File.ReadAllBytes(encryptedFile))) throw new Exception("encrypted repack readback failed");
             }
-            Console.WriteLine("self-test passed (V3 index/name cipher, 1PC decode, modified payload, unchanged reuse, encrypted decode/repack/readback, raw-edit rejection)");
+            var keyChainPath = Path.Combine(root, "key-chain.pack");
+            var keyChainKeyPath = Path.Combine(root, "key-chain.key");
+            var keyChainGameKeyPath = Path.Combine(root, "key-chain.gamekey");
+            SyntheticFixture.CreateKeyChain(keyChainPath, keyChainKeyPath, keyChainGameKeyPath);
+            using (var keyChain = QlieArchive.Open(keyChainPath, keyChainKeyPath, keyChainGameKeyPath))
+            {
+                if (keyChain.Entries.Count != 3 || keyChain.Entries[0].Name != "pack_keyfile.bin" ||
+                    keyChain.Entries[1].Name != SyntheticFixture.KeyChainPayloadName || keyChain.Entries[2].Name != SyntheticFixture.KeyChainSecondPayloadName)
+                    throw new Exception("synthetic pack_keyfile fixture index failed");
+                if (!keyChain.Entries[0].KeyFile!.SequenceEqual(SyntheticFixture.ExternalKey))
+                    throw new Exception("synthetic pack_keyfile first entry did not retain external key");
+                if (!keyChain.Entries[1].KeyFile!.SequenceEqual(SyntheticFixture.EmbeddedKey) || ReferenceEquals(keyChain.Entries[0].KeyFile, keyChain.Entries[1].KeyFile) ||
+                    !keyChain.Entries[2].KeyFile!.SequenceEqual(SyntheticFixture.EmbeddedKey))
+                    throw new Exception("synthetic pack_keyfile active key was not replaced by embedded key");
+                if (keyChain.Entries.Any(e => e.GameKeyData == null || !e.GameKeyData.SequenceEqual(SyntheticFixture.KeyChainGameKey)))
+                    throw new Exception("synthetic pack_keyfile entries did not retain the same non-empty game-key");
+                if (!keyChain.Entries[1].CipherNameBytes.SequenceEqual(SyntheticFixture.KeyChainPayloadRawName) ||
+                    !keyChain.Entries[2].CipherNameBytes.SequenceEqual(SyntheticFixture.KeyChainSecondPayloadRawName))
+                    throw new Exception("synthetic pack_keyfile payload lost encrypted index name bytes");
+                var expectedPayloads = new[] { SyntheticFixture.KeyChainPayload, SyntheticFixture.KeyChainSecondPayload };
+                for (var i = 1; i < keyChain.Entries.Count; i++)
+                {
+                    using var decoded = keyChain.OpenDecoded(keyChain.Entries[i]);
+                    using var decodedBytes = new MemoryStream(); decoded.CopyTo(decodedBytes);
+                    if (!decodedBytes.ToArray().SequenceEqual(expectedPayloads[i - 1]))
+                        throw new Exception($"synthetic pack_keyfile active-key/game-key payload {i} decode failed");
+                }
+            }
+            SyntheticFixture.VerifyCipherKnownVectors();
+            Console.WriteLine("self-test passed (V3 index/name cipher, 1PC decode, variable-size grow/shrink repack and readback, streamed unchanged reuse, relocated index/footer, opaque gap/trailer preservation, encrypted decode/repack/readback, synthetic pack_keyfile chain with non-empty game-key, clear-name/null/empty/non-empty fixed vectors, raw-edit rejection)");
             return 0;
         }
         finally { try { Directory.Delete(root, true); } catch { } }
@@ -512,7 +558,7 @@ public sealed class QlieArchive : IDisposable
     {
         file.Position = IndexOffset;
         byte[]? activeKey = keyFile;
-        var readPackKeyfile = false;
+        var readPackKeyfile = keyFile != null;
         for (var i = 0; i < count; i++)
         {
             var n = ReadUInt16(file); if (n > 0x100) throw new InvalidDataException($"entry {i}: invalid name length {n}");
@@ -525,9 +571,9 @@ public sealed class QlieArchive : IDisposable
             Entries.Add(entry);
             if (file.Position > trailerStart) throw new InvalidDataException("QLIE index overlaps the 0x400-byte V3 trailer block");
             var nextIndex = file.Position;
-            if (!readPackKeyfile && activeKey != null && name.IndexOf("pack_keyfile", StringComparison.OrdinalIgnoreCase) >= 0)
+            if (readPackKeyfile && activeKey != null && name.IndexOf("pack_keyfile", StringComparison.OrdinalIgnoreCase) >= 0)
             {
-                readPackKeyfile = true;
+                readPackKeyfile = false;
                 var payload = ReadRawPayload(entry);
                 if (entry.Encryption != 0) DecryptEntry(payload, entry, activeKey, gameKeyData);
                 if (entry.Packed) payload = Decompress1Pc(payload, entry.UnpackedSize) ?? throw new InvalidDataException($"entry {i}: invalid embedded key payload");
@@ -605,8 +651,10 @@ public sealed class QlieArchive : IDisposable
     private static long ReadInt64At(Stream s,long pos){s.Position=pos;return ReadInt64(s);}
     private static ushort ReadUInt16(Stream s)=>BitConverter.ToUInt16(ReadExactly(s,2));
     private static uint ReadUInt32(Stream s)=>BitConverter.ToUInt32(ReadExactly(s,4));
-    private static uint CalculateArcKey(byte[] data)
-    { ulong hash=0,key=0; for(var i=0;i+8<=data.Length;i+=8){hash=PackedMath.AddW(hash,0x0307030703070307);key=PackedMath.AddW(key,BitConverter.ToUInt64(data,i)^hash);} return (uint)(key^(key>>32))&0x0fffffff; }
+    internal static uint CalculateArcKey(ReadOnlySpan<byte> data)
+    { ulong hash=0,key=0; for(var i=0;i+8<=data.Length;i+=8){hash=PackedMath.AddW(hash,0x0307030703070307);key=PackedMath.AddW(key,BitConverter.ToUInt64(data.Slice(i,8))^hash);} return (uint)(key^(key>>32))&0x0fffffff; }
+    internal static uint CalculateStoredChecksum(ReadOnlySpan<byte> data)
+    { ulong state=0,acc=0; for(var i=0;i+8<=data.Length;i+=8){state=PackedMath.AddW(state,0x0307030703070307);acc=PackedMath.AddW(acc,BitConverter.ToUInt64(data.Slice(i,8))^state);} return (uint)(acc^(acc>>32)); }
     public static byte[]? Decompress1Pc(byte[] input, uint expectedSize)
     {
         const int maxOutput = 256 * 1024 * 1024;
@@ -698,12 +746,19 @@ public interface IV3EntryCipher
 
 public interface IEntryHashProvider
 {
-    uint ComputeHash(byte[] decodedPayload, QlieEntry sourceEntry);
+    uint ComputeHash(byte[] storedPayload, QlieEntry sourceEntry);
 }
 
+/// <summary>V3 TOC hash: native arc_pack checksum over stored bytes, complete little-endian qwords only.</summary>
+public sealed class QlieStoredPayloadHashProvider : IEntryHashProvider
+{
+    public uint ComputeHash(byte[] storedPayload, QlieEntry sourceEntry) => QlieArchive.CalculateStoredChecksum(storedPayload);
+}
+
+/// <summary>Retained for synthetic/compatibility paths; unsafe for a modified source entry.</summary>
 public sealed class PreserveSourceEntryHashProvider : IEntryHashProvider
 {
-    public uint ComputeHash(byte[] decodedPayload, QlieEntry sourceEntry) => sourceEntry.Hash;
+    public uint ComputeHash(byte[] storedPayload, QlieEntry sourceEntry) => sourceEntry.Hash;
 }
 
 public sealed class PlainEntryPayloadCodec : IEntryPayloadCodec
@@ -714,7 +769,9 @@ public sealed class PlainEntryPayloadCodec : IEntryPayloadCodec
 public sealed class QlieRepackItem
 {
     public required string Name { get; init; }
-    public required byte[] Stored { get; init; }
+    public required byte[]? Stored { get; init; }
+    public required uint StoredSize { get; init; }
+    public required bool ReuseSourceStored { get; init; }
     public required uint UnpackedSize { get; init; }
     public required bool Packed { get; init; }
     public required int Encryption { get; init; }
@@ -743,7 +800,9 @@ public sealed class QlieV3EntryCipher : IV3EntryCipher
     {
         if (data.Length < 8) return;
         var length = (uint)data.Length;
-        if (gameKey == null || gameKey.Length == 0)
+        // GARbro falls back to the V2 transform only for an explicitly supplied empty
+        // GameKeyData value. A null GameKeyData still uses the V3 MT/key.fkey path.
+        if (gameKey is { Length: 0 })
         {
             ulong state = 0xA73C5F9DA73C5F9DUL;
             ulong feedback = ((ulong)(length + arcKey) ^ 0xFEC9753Eu);
@@ -761,13 +820,18 @@ public sealed class QlieV3EntryCipher : IV3EntryCipher
         }
 
         uint hash = 0x85F532, seed = 0x33F641;
+        // GARbro's PackIndexReader calls DecryptName on its shared name buffer before
+        // copying that buffer to QlieEntry.RawName. DecryptName mutates it in place,
+        // so V3's seed is based on the decoded CP932 name bytes, not the ciphertext
+        // preserved separately here for index round-tripping.
         var seedName = entry.ClearNameBytes.Length != 0 ? entry.ClearNameBytes : Encoding.GetEncoding(932).GetBytes(entry.Name);
         for (uint i = 0; i < seedName.Length; i++) { hash += (i & 0xff) * seedName[i]; seed ^= hash; }
         seed += arcKey ^ (7 * (length & 0xffffff) + length + hash + (hash ^ length ^ 0x8f32dcu));
         seed = 9 * (seed & 0xffffff);
-        seed ^= 0x453Au;
+        if (gameKey != null) seed ^= 0x453Au;
         var mt = new QlieMersenneTwister(seed);
-        mt.XorState(keyFile); mt.XorState(gameKey);
+        mt.XorState(keyFile);
+        if (gameKey != null) mt.XorState(gameKey);
         var table = new ulong[16]; for (var i = 0; i < table.Length; i++) table[i] = mt.Rand64();
         for (var i = 0; i < 9; i++) mt.Rand();
         ulong hash64 = mt.Rand64(); uint t2 = mt.Rand() & 0xf;
@@ -787,8 +851,6 @@ public sealed class QlieV3EntryCipher : IV3EntryCipher
 
 public static class QlieRepacker
 {
-    private const int IndexEntryFixed = 2 + 8 + 4 + 4 + 4 + 4 + 4;
-    private const int PayloadAlignment = 0x10;
     private const int TrailerSize = 0x400;
     private const int FooterSize = 0x1c;
 
@@ -802,7 +864,7 @@ public static class QlieRepacker
         if (manifest.IndexOffset != archive.IndexOffset || manifest.ArchiveLength != archive.FileLength)
             throw new InvalidDataException("manifest archive metadata does not match source archive");
         var byIndex = manifest.Entries.ToDictionary(x => x.Index);
-        hashProvider ??= new PreserveSourceEntryHashProvider();
+        hashProvider ??= new QlieStoredPayloadHashProvider();
         var items = new List<QlieRepackItem>(archive.Entries.Count);
         foreach (var source in archive.Entries)
         {
@@ -819,7 +881,7 @@ public static class QlieRepacker
             var expected = row.Decoded ? row.ExtractedSha256 : row.PayloadSha256;
             if (string.Equals(fileHash, expected, StringComparison.OrdinalIgnoreCase))
             {
-                items.Add(new QlieRepackItem { Name=source.Name, Stored=ReadStored(archive, source), UnpackedSize=source.UnpackedSize,
+                items.Add(new QlieRepackItem { Name=source.Name, Stored=null, StoredSize=source.StoredSize, ReuseSourceStored=true, UnpackedSize=source.UnpackedSize,
                     Packed=source.Packed, Encryption=source.Encryption, Hash=source.Hash, CipherNameBytes=source.CipherNameBytes.ToArray(), Source=source });
                 continue;
             }
@@ -828,19 +890,18 @@ public static class QlieRepacker
                 throw new UnsupportedEncryptedRewriteException($"entry {source.Index} is the active pack_keyfile; editing it would invalidate the active key chain for entries {source.Index + 1}..{archive.Entries.Count - 1} (offset=0x{source.Offset:X})");
             if (source.Encryption != 0 && cipher == null)
                 throw new UnsupportedEncryptedRewriteException($"entry {source.Index} edited encrypted payload at offset 0x{source.Offset:X}; provide IV3EntryCipher to prove inverse V3 encryption/signature generation");
-            if (source.Packed)
-                throw new UnsupportedEncryptedRewriteException($"entry {source.Index} is packed; the built-in writer has no proven 1PC encoder, so literal packed=false output is rejected");
             var decoded = File.ReadAllBytes(path);
             var encoded = codec.Encode(decoded, source);
+            var packed = source.Packed;
             var encryption = 0;
-            var packed = false;
             if (source.Encryption != 0)
             {
                 encoded = cipher!.Encrypt(encoded, source, source.Name);
                 encryption = source.Encryption;
             }
-            items.Add(new QlieRepackItem { Name=source.Name, Stored=encoded, UnpackedSize=checked((uint)decoded.Length), Packed=packed,
-                Encryption=encryption, Hash=hashProvider.ComputeHash(decoded, source), CipherNameBytes=source.CipherNameBytes.ToArray(), Source=source });
+            items.Add(new QlieRepackItem { Name=source.Name, Stored=encoded, StoredSize=checked((uint)encoded.Length), ReuseSourceStored=false,
+                UnpackedSize=checked((uint)decoded.Length), Packed=packed, Encryption=encryption,
+                Hash=hashProvider.ComputeHash(encoded, source), CipherNameBytes=source.CipherNameBytes.ToArray(), Source=source });
         }
         WriteArchive(archive, items, outputPath, trailerOverride);
     }
@@ -871,27 +932,29 @@ public static class QlieRepacker
         Directory.CreateDirectory(Path.GetDirectoryName(outputPath)!);
         using var output = new FileStream(outputPath, FileMode.CreateNew, FileAccess.Write, FileShare.None, 1 << 20, FileOptions.SequentialScan);
 
-        // V3 stores payloads in source order with no per-entry alignment requirement.
-        // Keep the exact source offsets/gaps and reject size changes rather than shifting
-        // later payloads while retaining an unverified HashVer1.3 region.
+        // Rebuild payloads contiguously in source TOC order. The V3 reader provides no
+        // per-entry alignment rule; each new index offset is derived from bytes written.
         for (var i = 0; i < items.Count; i++)
         {
-            var source = archive.Entries[i];
-            if (i > 0 && source.Offset < archive.Entries[i - 1].Offset + archive.Entries[i - 1].StoredSize)
-                throw new InvalidDataException($"source payload placement is not monotonic at entry {i}");
-            if ((long)items[i].Stored.Length != source.StoredSize)
-                throw new UnsupportedEncryptedRewriteException($"entry {i} stored size changed from {source.StoredSize} to {items[i].Stored.Length}; refusing to shift payloads or claim HashVer1.3 compatibility");
-            if (output.Position > source.Offset) throw new InvalidDataException($"source payload offset already passed at entry {i}");
-            if (output.Position < source.Offset)
-                archive.CopyRangeTo(output, output.Position, source.Offset - output.Position);
+            if (items[i].Source.Index != archive.Entries[i].Index)
+                throw new InvalidDataException($"repack item order differs from source TOC at entry {i}");
             offsets[i] = output.Position;
-            output.Write(items[i].Stored, 0, items[i].Stored.Length);
+            if (items[i].ReuseSourceStored)
+            {
+                if (items[i].Stored != null || items[i].StoredSize != items[i].Source.StoredSize)
+                    throw new InvalidDataException($"entry {i} source-streamed payload metadata is inconsistent");
+                archive.CopyRangeTo(output, items[i].Source.Offset, items[i].StoredSize);
+            }
+            else
+            {
+                var stored = items[i].Stored ?? throw new InvalidDataException($"entry {i} rebuilt payload is missing");
+                if (items[i].StoredSize != (uint)stored.Length)
+                    throw new InvalidDataException($"entry {i} rebuilt payload size metadata is inconsistent");
+                output.Write(stored, 0, stored.Length);
+            }
         }
-        if (output.Position > archive.IndexOffset) throw new InvalidDataException("payloads overlap source index");
-        if (output.Position < archive.IndexOffset)
-            archive.CopyRangeTo(output, output.Position, archive.IndexOffset - output.Position);
+
         var indexOffset = output.Position;
-        if (indexOffset != archive.IndexOffset) throw new InvalidDataException("failed to preserve source index offset");
         for (var i = 0; i < items.Count; i++)
         {
             var item = items[i];
@@ -900,17 +963,17 @@ public static class QlieRepacker
             output.Write(BitConverter.GetBytes((ushort)name.Length));
             output.Write(name, 0, name.Length);
             output.Write(BitConverter.GetBytes(offsets[i]));
-            output.Write(BitConverter.GetBytes((uint)item.Stored.Length));
+            output.Write(BitConverter.GetBytes(item.StoredSize));
             output.Write(BitConverter.GetBytes(item.UnpackedSize));
             output.Write(BitConverter.GetBytes(item.Packed ? 1 : 0));
             output.Write(BitConverter.GetBytes(item.Encryption));
             output.Write(BitConverter.GetBytes(item.Hash));
         }
-        if (output.Position != archive.IndexEnd) throw new InvalidDataException($"rebuilt index end 0x{output.Position:X} differs from source 0x{archive.IndexEnd:X}");
-        var hashVerGap = archive.CopyIndexTrailerGap();
-        output.Write(hashVerGap, 0, hashVerGap.Length);
-        if (output.Position != archive.TrailerStart) throw new InvalidDataException("failed to preserve source HashVer1.3/trailer position");
+
+        // Regenerate the v1.3 name index and its terminal marker after payload/index relocation.
         var trailer = trailerOverride ?? archive.CopyTrailerBlock();
+        var hashVerGap = HashVer13.RebuildGap(archive, trailer);
+        output.Write(hashVerGap, 0, hashVerGap.Length);
         if (trailer.Length != TrailerSize) throw new InvalidDataException("V3 trailer block must be exactly 0x400 bytes");
         output.Write(trailer, 0, trailer.Length);
         var footer = archive.CopyFooter();
@@ -974,10 +1037,11 @@ public static class SyntheticFixture
     public static readonly byte[] PackedPlain = Encoding.UTF8.GetBytes("packed fixture");
     public static void Create(string path)
     {
-        var entries=new[]{(Name:"hello.txt",Data:Encoding.UTF8.GetBytes("hello QLIE"),Packed:false),(Name:"packed.bin",Data:MakePacked(),Packed:true),(Name:"raw.bin",Data:Encoding.ASCII.GetBytes("unsupported raw payload"),Packed:true)};
+        var entries=new[]{(Name:"hello.txt",Data:Encoding.UTF8.GetBytes("hello QLIE"),Packed:false),(Name:"packed.bin",Data:MakePacked(),Packed:true),(Name:"raw.bin",Data:Encoding.ASCII.GetBytes("unsupported raw payload"),Packed:true),(Name:"tail.bin",Data:Encoding.ASCII.GetBytes("tail payload stays untouched"),Packed:false)};
         using var f=new FileStream(path,FileMode.CreateNew,FileAccess.Write,FileShare.None);var indexOffset=0L;var offsets=new List<long>();
         foreach(var e in entries){offsets.Add(f.Position);f.Write(e.Data);}
         indexOffset=f.Position;foreach(var x in entries){var raw=EncodeName(x.Name,0);f.Write(BitConverter.GetBytes((ushort)raw.Length));f.Write(raw);f.Write(BitConverter.GetBytes(offsets[Array.IndexOf(entries,x)]));f.Write(BitConverter.GetBytes((uint)x.Data.Length));f.Write(BitConverter.GetBytes((uint)(x.Packed?PackedPlain.Length:x.Data.Length)));f.Write(BitConverter.GetBytes(x.Packed?1:0));f.Write(BitConverter.GetBytes(0));f.Write(BitConverter.GetBytes(0u));}
+        f.Write(Encoding.ASCII.GetBytes("HashVer1.3\0synthetic-opaque-gap"));
         var pad=0x400; f.Write(new byte[pad]);var footer=f.Position;f.Write(Encoding.ASCII.GetBytes("FilePackVer3.0"));f.Write(new byte[2]);f.Write(BitConverter.GetBytes(entries.Length));f.Write(BitConverter.GetBytes(indexOffset));
     }
     private static byte[] MakePacked(){var body=PackedPlain;using var m=new MemoryStream();m.Write(BitConverter.GetBytes(0xff435031u));m.WriteByte(0);m.WriteByte(0);m.Write(BitConverter.GetBytes(body.Length));m.WriteByte(0);m.WriteByte(255); // skip 128 nodes? construct simple leaf table: 0..255 identity encoded as 255, then one entry
@@ -997,6 +1061,73 @@ public static class SyntheticFixture
         f.Write(stored); var indexOffset = f.Position;
         f.Write(BitConverter.GetBytes((ushort)raw.Length)); f.Write(raw); f.Write(BitConverter.GetBytes(0L)); f.Write(BitConverter.GetBytes((uint)stored.Length)); f.Write(BitConverter.GetBytes((uint)EncryptedPlain.Length)); f.Write(BitConverter.GetBytes(0)); f.Write(BitConverter.GetBytes(4)); f.Write(BitConverter.GetBytes(0u));
         f.Write(new byte[0x400]); f.Write(Encoding.ASCII.GetBytes("FilePackVer3.0")); f.Write(new byte[2]); f.Write(BitConverter.GetBytes(1)); f.Write(BitConverter.GetBytes(indexOffset));
+    }
+
+    public static readonly byte[] ExternalKey = Enumerable.Range(0, 32).Select(i => (byte)(0x20 + i)).ToArray();
+    public static readonly byte[] EmbeddedKey = Enumerable.Range(0, 32).Select(i => (byte)(0x80 + i)).ToArray();
+    public static readonly byte[] KeyChainGameKey = Enumerable.Range(0, 24).Select(i => (byte)(0x40 + i)).ToArray();
+    public const string KeyChainPayloadName = "payload.bin";
+    public const string KeyChainSecondPayloadName = "payload-second.bin";
+    public static readonly byte[] KeyChainPayload = Enumerable.Range(0, 32).Select(i => (byte)(0xD0 - i)).ToArray();
+    public static readonly byte[] KeyChainSecondPayload = Enumerable.Range(0, 32).Select(i => (byte)(0x60 + i)).ToArray();
+    public static readonly byte[] KeyChainPayloadRawName = EncodeName(KeyChainPayloadName, 0);
+    public static readonly byte[] KeyChainSecondPayloadRawName = EncodeName(KeyChainSecondPayloadName, 0);
+
+    public static void CreateKeyChain(string path, string keyPath, string gameKeyPath)
+    {
+        File.WriteAllBytes(keyPath, ExternalKey);
+        File.WriteAllBytes(gameKeyPath, KeyChainGameKey);
+        var names = new[] { "pack_keyfile.bin", KeyChainPayloadName, KeyChainSecondPayloadName };
+        var plains = new[] { EmbeddedKey, KeyChainPayload, KeyChainSecondPayload };
+        var keys = new[] { ExternalKey, EmbeddedKey, EmbeddedKey };
+        var rawNames = new byte[names.Length][];
+        var stored = new byte[names.Length][];
+        for (var i = 0; i < names.Length; i++)
+        {
+            rawNames[i] = EncodeName(names[i], 0);
+            var entry = new QlieEntry { Index=i, Name=names[i], CipherNameBytes=rawNames[i], ClearNameBytes=Encoding.GetEncoding(932).GetBytes(names[i]), Encryption=4, KeyFile=keys[i], GameKeyData=KeyChainGameKey };
+            stored[i] = plains[i].ToArray();
+            QlieV3EntryCipher.Transform(stored[i], entry, 0, keys[i], KeyChainGameKey, true);
+        }
+
+        using var f = new FileStream(path, FileMode.CreateNew, FileAccess.Write, FileShare.None);
+        var offsets = new long[stored.Length];
+        for (var i = 0; i < stored.Length; i++) { offsets[i] = f.Position; f.Write(stored[i]); }
+        var indexOffset = f.Position;
+        for (var i = 0; i < stored.Length; i++)
+        {
+            f.Write(BitConverter.GetBytes((ushort)rawNames[i].Length)); f.Write(rawNames[i]);
+            f.Write(BitConverter.GetBytes(offsets[i])); f.Write(BitConverter.GetBytes((uint)stored[i].Length));
+            f.Write(BitConverter.GetBytes((uint)plains[i].Length)); f.Write(BitConverter.GetBytes(0));
+            f.Write(BitConverter.GetBytes(4)); f.Write(BitConverter.GetBytes(0u));
+        }
+        f.Write(new byte[0x400]); f.Write(Encoding.ASCII.GetBytes("FilePackVer3.0")); f.Write(new byte[2]);
+        f.Write(BitConverter.GetBytes(stored.Length)); f.Write(BitConverter.GetBytes(indexOffset));
+    }
+
+    public static void VerifyCipherKnownVectors()
+    {
+        var plain = Convert.FromHexString("0102030405060708090A0B0C0D0E0F101112131415161718");
+        var cipherName = Convert.FromHexString("7119A43302D16E88");
+        var key = Convert.FromHexString("030A11181F262D343B424950575E656C737A81888F969DA4ABB2B9C0C7CED5DC");
+        var game = Convert.FromHexString("E0DDDAD7D4D1CECBC8C5C2BF");
+        var cases = new[]
+        {
+            (Cipher: "24524BB06460C18FA6C95871E612AB077A70DACCE2718067", GameKey: (byte[]?)null, Label: "null game-key"),
+            (Cipher: "8066888E84628C82AC51B850AC51B840D048C032DC4CC416", GameKey: Array.Empty<byte>(), Label: "empty game-key"),
+            (Cipher: "F3355FD8AC2C67A7108C483D568217098E2C0B6532217ADB", GameKey: game, Label: "non-empty game-key")
+        };
+        foreach (var test in cases)
+        {
+            var entry = new QlieEntry
+            {
+                Name="vector.bin", CipherNameBytes=cipherName,
+                ClearNameBytes=Encoding.GetEncoding(932).GetBytes("vector.bin"), Encryption=4
+            };
+            var actual = Convert.FromHexString(test.Cipher);
+            QlieV3EntryCipher.Transform(actual, entry, 0x1234567, key, test.GameKey, false);
+            if (!actual.SequenceEqual(plain)) throw new Exception($"fixed {test.Label} clear-name cipher vector failed");
+        }
     }
 
 }

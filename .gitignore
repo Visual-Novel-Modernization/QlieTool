@@ -1,14 +1,23 @@
-bin/
-obj/
-.cli-home/
-.nuget/
+# IDE 与编译缓存
+.vs/
 *.user
 *.suo
-*.log
+bin/
+obj/
+
+# 敏感版权与密钥资产
 *.pack
-*.xp3
-*.dll
-*.exe
-*.pdb
-*.cache
-*.json
+*.fkey
+*.key
+GameKeyData*
+*.bin
+
+# 历史调试与恢复碎片
+*.recovered.*
+history-*.txt
+recover.py
+inventory.*
+diff-hv.*
+*.log
+*.txt
+

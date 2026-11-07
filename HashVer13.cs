@@ -77,6 +77,9 @@ public static class HashVer13
     public static byte[] RebuildGap(QlieArchive archive, byte[] trailerBlock)
     {
         var sourceGap = archive.CopyIndexTrailerGap();
+        var hash14 = Encoding.ASCII.GetBytes("HashVer1.4\0\0");
+        if (sourceGap.Length >= 68 && sourceGap.AsSpan(0, 12).SequenceEqual(hash14))
+            return RebuildGap14(archive, trailerBlock, sourceGap);
         var magic = Encoding.ASCII.GetBytes("HashVer1.3\0\0");
         if (sourceGap.Length < 68 || !sourceGap.AsSpan(0, 12).SequenceEqual(magic))
             return sourceGap; // Preserve non-HashVer V3 fixtures and unknown variants verbatim.
@@ -129,6 +132,60 @@ public static class HashVer13
         WriteU32(section, entryCount);
         WriteU32(section, checked((uint)extraLength));
         WriteU32(section, checked((uint)rebuiltEncrypted.Length));
+        section.Write(rebuiltEncrypted);
+        var sectionBytes = section.ToArray();
+        var terminal = BuildTerminalMarker(sourceSuffix.Slice(0, 32), checked((uint)sectionBytes.Length));
+        var result = new byte[checked(sectionBytes.Length + terminal.Length)];
+        sectionBytes.CopyTo(result, 0);
+        terminal.CopyTo(result, sectionBytes.Length);
+        return result;
+    }
+
+    /// <summary>Rebuild the observed V3.0 HashVer1.4 section. The native writer emits a 68-byte header,
+    /// a transformed 1PC name table, and the same 36-byte terminal marker lane used by V1.3.</summary>
+    private static byte[] RebuildGap14(QlieArchive archive, byte[] trailerBlock, byte[] sourceGap)
+    {
+        if (trailerBlock.Length != 0x400) throw new InvalidDataException("V3 trailer block must be 0x400 bytes");
+        var bucketCount = BinaryPrimitives.ReadUInt32LittleEndian(sourceGap.AsSpan(0x10, 4));
+        var entryCount = BinaryPrimitives.ReadUInt32LittleEndian(sourceGap.AsSpan(0x14, 4));
+        var extraLength = BinaryPrimitives.ReadUInt32LittleEndian(sourceGap.AsSpan(0x18, 4));
+        var compressedLength = BinaryPrimitives.ReadUInt32LittleEndian(sourceGap.AsSpan(0x1c, 4));
+        if (bucketCount != 256 || entryCount != archive.Entries.Count || extraLength != entryCount * 2)
+            throw new InvalidDataException("HashVer1.4 group, entry, or observed extra-tail counts do not match");
+        if (compressedLength > int.MaxValue || 68L + compressedLength + 36 != sourceGap.Length)
+            throw new InvalidDataException("HashVer1.4 compressed stream and terminal prefix do not cover the source gap");
+        var sourceSuffix = sourceGap.AsSpan(checked(68 + (int)compressedLength), 36);
+        var sourceSectionLength = checked((uint)(68 + compressedLength));
+        if (BinaryPrimitives.ReadUInt32LittleEndian(sourceSuffix.Slice(32, 4)) != sourceSectionLength)
+            throw new InvalidDataException("HashVer1.4 terminal copy-length field is inconsistent");
+        var arcKey = QlieArchive.CalculateArcKey(trailerBlock.AsSpan(0, 0x100));
+        if (arcKey != archive.ArcKey) throw new InvalidDataException("HashVer1.4 terminal key changed; rebuilding a trailer-derived ArcKey is not implemented");
+
+        var encryptedStream = sourceGap.AsSpan(68, checked((int)compressedLength)).ToArray();
+        var packedStream = Transform(encryptedStream, 0x428, 0, encrypt: false);
+        var highLevelStream = Transform(encryptedStream, 0x428 - encryptedStream.Length, 0, encrypt: false);
+        if (packedStream.Length >= 4 && !(packedStream[0] == 0x31 && packedStream[1] == 0x50 && packedStream[2] == 0x43 && packedStream[3] == 0xFF))
+            packedStream = highLevelStream;
+        if (packedStream.Length < 12 || packedStream[0] != 0x31 || packedStream[1] != 0x50 || packedStream[2] != 0x43 || packedStream[3] != 0xFF)
+            throw new InvalidDataException("HashVer1.4 transformed stream does not begin with the expected 1PC wrapper");
+        var innerSize = BinaryPrimitives.ReadUInt32LittleEndian(packedStream.AsSpan(8, 4));
+        if (innerSize > 0x20000000) throw new InvalidDataException("HashVer1.4 inner 1PC output exceeds the native decoder bound");
+        var decoded = QlieArchive.Decompress1Pc(packedStream, innerSize)
+            ?? throw new InvalidDataException("HashVer1.4 1PC stream failed to decode");
+        if (decoded.Length < extraLength) throw new InvalidDataException("HashVer1.4 extra tail exceeds decoded table size");
+        var rebuiltDecoded = RebuildDecodedTable(decoded, archive.Entries, checked((int)extraLength));
+        var rebuiltPacked = Encode1Pc(rebuiltDecoded);
+        var rebuiltEncrypted = Transform(rebuiltPacked, 0x428, 0, encrypt: true);
+
+        using var section = new MemoryStream(checked(68 + rebuiltEncrypted.Length));
+        section.Write(Encoding.ASCII.GetBytes("HashVer1.4\0\0"));
+        section.Write(new byte[4]);
+        WriteU32(section, bucketCount);
+        WriteU32(section, entryCount);
+        WriteU32(section, extraLength);
+        WriteU32(section, checked((uint)rebuiltEncrypted.Length));
+        WriteU32(section, 1); // HV1.4 mode marker observed at +0x20; +0x24..+0x40 are reserved zeroes.
+        section.Write(new byte[32]);
         section.Write(rebuiltEncrypted);
         var sectionBytes = section.ToArray();
         var terminal = BuildTerminalMarker(sourceSuffix.Slice(0, 32), checked((uint)sectionBytes.Length));

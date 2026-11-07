@@ -36,19 +36,34 @@ public static class Program
 
     private static void Usage()
     {
-        Console.WriteLine("QlieTool - QLIE FilePackVer3.0 archive utility");
+        Console.WriteLine("QlieTool - QLIE FilePack archive utility (V1.0, V3.0, V3.1)");
         Console.WriteLine("  list <archive.pack> [--key key.fkey] [--game-key keydata.bin]");
-        Console.WriteLine("  extract <archive.pack> <directory> [--key key.fkey] [--game-key keydata.bin] [--manifest manifest.json]");
-        Console.WriteLine("  repack <manifest.json> <output.pack> --source <original.pack> --input-dir <extracted-dir> [--key key.fkey] [--game-key keydata.bin]");
+        Console.WriteLine("  extract <archive.pack> <directory> [--key key.fkey] [--game-key keydata.bin] [--dpng] [--manifest manifest.json]");
+        Console.WriteLine("  repack <manifest.json> <output.pack> --source <original.pack> --input-dir <extracted-dir> [--key key.fkey] [--game-key keydata.bin] [--dpng]");
         Console.WriteLine("  clone <manifest.json> <output.pack> --source <original.pack> --input-dir <extracted-dir> (compatibility alias)");
         Console.WriteLine("  verify <archive.pack> [--key key.fkey] [--game-key keydata.bin]");
         Console.WriteLine("  self-test");
+        Console.WriteLine("V1.0 repack requires literal entries for edits; unchanged entries stream-copy. V3.1 repack validates keyfile and rebuilds all versioned sections.");
         Console.WriteLine("repack rebuilds payloads, index and footer; unchanged payload bytes may be reused.");
     }
 
     private static int RunList(string[] args)
     {
         Require(args, 2);
+        if (QlieV1Pack.IsV1(args[1]))
+        {
+            var files = QlieV1Pack.List(args[1]);
+            Console.WriteLine($"QLIE FilePackVer1.0; count={files.Count}");
+            foreach (var e in files) Console.WriteLine($"{e.Index,6} {e.Offset,12} {e.StoredSize,10} {e.UnpackedSize,10} flags=0x{e.Flags:X16} hash=0x{e.Hash:X8} {e.Name}");
+            return 0;
+        }
+        if (QlieModernArchive.IsMatch(args[1]))
+        {
+            var files = QlieModernArchive.List(args[1]);
+            Console.WriteLine($"QLIE FilePackVer3.1; count={files.Count}");
+            foreach (var e in files) Console.WriteLine($"{e.StoredSize,10} {e.Size,10} compressed={e.Compressed,-5} obfuscation={e.Obfuscated,-3} {e.Name}");
+            return 0;
+        }
         using var input = TempInput.CopyArchive(args[1], FindOption(args, "--key"), FindOption(args, "--game-key"));
         using var archive = QlieArchive.Open(input.ArchivePath, input.KeyPath, input.GameKeyPath);
         Console.WriteLine($"QLIE FilePackVer{archive.Version}; count={archive.Entries.Count}; index=0x{archive.IndexOffset:X}");
@@ -61,6 +76,20 @@ public static class Program
     {
         Require(args, 3);
         var output = PathGuards.EnsureDirectoryTree(args[2]);
+        if (QlieV1Pack.IsV1(args[1]))
+        {
+            var v1ManifestPath = FindOption(args, "--manifest");
+            var writtenManifest = QlieV1Pack.Extract(args[1], output, v1ManifestPath);
+            Console.WriteLine($"extracted V1.0 {QlieV1Pack.List(args[1]).Count} entries to {output}");
+            Console.WriteLine($"manifest {writtenManifest}");
+            return 0;
+        }
+        if (QlieModernArchive.IsMatch(args[1]))
+        {
+            var modernManifest = QlieModernArchive.Extract(args[1], output);
+            Console.WriteLine($"extracted {modernManifest.Files.Count} V3.1 entries to {output}");
+            return 0;
+        }
         using var input = TempInput.CopyArchive(args[1], FindOption(args, "--key"), FindOption(args, "--game-key"));
         using var archive = QlieArchive.Open(input.ArchivePath, input.KeyPath, input.GameKeyPath);
         var rows = new List<ManifestEntry>();
@@ -86,6 +115,14 @@ public static class Program
             using (var target = new FileStream(destination, FileMode.CreateNew, FileAccess.Write, FileShare.None, 1 << 20, FileOptions.SequentialScan))
                 source.CopyTo(target, 1 << 20);
             var row = archive.ManifestEntry(e, destination, decoded);
+            if (decoded && Path.GetExtension(e.Name).Equals(".png", StringComparison.OrdinalIgnoreCase))
+            {
+                var originalBytes = File.ReadAllBytes(destination);
+                row.OriginalImageContainer = QlieDpng.IsDpng(originalBytes) ? "DPNG" : originalBytes.AsSpan().StartsWith(new byte[] { 137, 80, 78, 71, 13, 10, 26, 10 }) ? "PNG" : "None";
+                if (row.OriginalImageContainer == "DPNG")
+                    File.WriteAllBytes(destination, QlieDpng.Decode(originalBytes));
+            }
+            row.ExtractedSha256 = Sha256File(destination);
             row.ExtractedPath = Path.GetRelativePath(output, destination);
             rows.Add(row);
         }
@@ -104,6 +141,24 @@ public static class Program
     private static int RunVerify(string[] args)
     {
         Require(args, 2);
+        if (QlieV1Pack.IsV1(args[1]))
+        {
+            var result = QlieV1Pack.Verify(args[1]);
+            Console.WriteLine($"verified {result.CheckedEntries} entries; FilePackVer1.0; index=0x{result.IndexOffset:X}; sha256={result.ArchiveSha256}");
+            return 0;
+        }
+        if (QlieModernArchive.IsMatch(args[1]))
+        {
+            var verifyRoot = Environment.GetEnvironmentVariable("QLIETOOL_TEMP_ROOT") ?? Path.GetTempPath();
+            var verifyPath = Path.Combine(verifyRoot, "qlie-v31-verify-" + Guid.NewGuid().ToString("N"));
+            try
+            {
+                var extracted = QlieModernArchive.Extract(args[1], verifyPath);
+                Console.WriteLine($"verified {extracted.Files.Count} entries; FilePackVer3.1");
+            }
+            finally { if (Directory.Exists(verifyPath)) Directory.Delete(verifyPath, true); }
+            return 0;
+        }
         using var input = TempInput.CopyArchive(args[1], FindOption(args, "--key"), FindOption(args, "--game-key"));
         using var archive = QlieArchive.Open(input.ArchivePath, input.KeyPath, input.GameKeyPath);
         var checkedEntries = 0;
@@ -150,6 +205,18 @@ public static class Program
         inputDir = Path.GetFullPath(inputDir);
         if (File.Exists(output)) throw new IOException($"refusing to overwrite {output}");
         if (string.Equals(output, source, StringComparison.OrdinalIgnoreCase)) throw new IOException("output archive must differ from source archive");
+        if (QlieV1Pack.IsV1(source))
+        {
+            QlieV1Pack.Repack(source, inputDir, output, manifestPath);
+            Console.WriteLine($"repacked modified V1.0 archive: {output}");
+            return 0;
+        }
+        if (QlieModernArchive.IsMatch(source))
+        {
+            QlieModernArchive.Repack(manifestPath, source, inputDir, output);
+            Console.WriteLine($"repacked modified V3.1 archive: {output}");
+            return 0;
+        }
         var manifest = JsonSerializer.Deserialize<QlieManifest>(File.ReadAllText(manifestPath), JsonOptions)
             ?? throw new InvalidDataException("invalid manifest");
         if (manifest.Format != "QLIE" || manifest.Version != "3.0") throw new InvalidDataException("manifest is not a QLIE V3.0 manifest");
@@ -158,15 +225,15 @@ public static class Program
         if (!string.Equals(Sha256File(input.ArchivePath), manifest.SourceSha256, StringComparison.OrdinalIgnoreCase))
             throw new InvalidDataException("source archive SHA-256 does not match manifest");
         using var archive = QlieArchive.Open(input.ArchivePath, input.KeyPath, input.GameKeyPath);
-        QlieRepacker.Repack(archive, manifest, inputDir, output, new QliePayloadCodec(), new QlieV3EntryCipher(archive), null);
+        QlieRepacker.Repack(archive, manifest, inputDir, output, new QliePayloadCodec(), new QlieV3EntryCipher(archive), null, convertDpng: HasOption(args, "--dpng"));
         Console.WriteLine($"repacked modified archive: {output}");
-        Console.WriteLine("HashVer1.3/1PC sections rebuilt; this archive was structurally verified but not launched in the game runtime.");
+        Console.WriteLine("HashVer section and 1PC sections rebuilt; this archive was structurally verified but not launched in the game runtime.");
         return 0;
     }
 
     private static int RunSelfTest()
     {
-        var root = Path.Combine(Path.GetTempPath(), "QlieTool-selftest-" + Guid.NewGuid().ToString("N"));
+        var root = Path.Combine(Environment.GetEnvironmentVariable("QLIETOOL_TEMP_ROOT") ?? Path.GetTempPath(), "QlieTool-selftest-" + Guid.NewGuid().ToString("N"));
         Directory.CreateDirectory(root);
         try
         {
@@ -282,6 +349,7 @@ public static class Program
         finally { try { Directory.Delete(root, true); } catch { } }
     }
 
+    private static bool HasOption(string[] args, string name) => args.Contains(name, StringComparer.OrdinalIgnoreCase);
     private static string? FindOption(string[] args, string name)
     {
         var i = Array.IndexOf(args, name);
@@ -373,7 +441,7 @@ public sealed class TempInput : IDisposable
         archive = Path.GetFullPath(archive);
         if (!File.Exists(archive)) throw new FileNotFoundException("archive", archive);
         PathGuards.EnsureNoReparseComponents(archive, false);
-        var d = Path.Combine(Path.GetTempPath(), "QlieTool-" + Guid.NewGuid().ToString("N"));
+        var d = Path.Combine(Environment.GetEnvironmentVariable("QLIETOOL_TEMP_ROOT") ?? Path.GetTempPath(), "QlieTool-" + Guid.NewGuid().ToString("N"));
         Directory.CreateDirectory(d);
         try
         {
@@ -396,7 +464,13 @@ public sealed class TempInput : IDisposable
                 PathGuards.EnsureNoReparseComponents(key, false);
                 var k = Path.Combine(d, "key.fkey");
                 File.Copy(key, k);
+                var discovered = gameKey == null && IsEncryptedArchive(archive) && HasEncryptedKeyEntry(archive) ? QlieGameKey.Discover(archive, key) : null;
                 string? g = null;
+                if (discovered != null)
+                {
+                    g = Path.Combine(d, "game.keydata");
+                    File.WriteAllBytes(g, discovered);
+                }
                 if (gameKey != null)
                 {
                     gameKey = Path.GetFullPath(gameKey);
@@ -423,6 +497,25 @@ public sealed class TempInput : IDisposable
             try { Directory.Delete(d, true); } catch { }
             throw;
         }
+    }
+    private static bool HasEncryptedKeyEntry(string path)
+    {
+        try
+        {
+            using var archive = QlieArchive.Open(path, null, null);
+            return archive.Entries.Any(e => e.Encryption != 0 || e.Name.Contains("pack_keyfile", StringComparison.OrdinalIgnoreCase));
+        }
+        catch (InvalidDataException) { return false; }
+    }
+    private static bool IsEncryptedArchive(string path)
+    {
+        using var stream = File.OpenRead(path);
+        if (stream.Length < 28) return false;
+        stream.Position = stream.Length - 28;
+        Span<byte> magic = stackalloc byte[16];
+        stream.ReadExactly(magic);
+        var version = Encoding.ASCII.GetString(magic);
+        return version.StartsWith("FilePackVer3.0", StringComparison.Ordinal) || version.StartsWith("FilePackVer3.1", StringComparison.Ordinal);
     }
     public void Dispose() { try { Directory.Delete(dir, true); } catch { } }
 }
@@ -470,6 +563,7 @@ public sealed class ManifestEntry
     public uint Hash { get; set; }
     public string PayloadSha256 { get; set; } = "";
     public string ExtractedSha256 { get; set; } = "";
+    public string OriginalImageContainer { get; set; } = "";
     public bool Decoded { get; set; }
     public string ExtractedPath { get; set; } = "";
 }
@@ -855,7 +949,7 @@ public static class QlieRepacker
     private const int FooterSize = 0x1c;
 
     public static void Repack(QlieArchive archive, QlieManifest manifest, string inputDir, string outputPath,
-        IEntryPayloadCodec codec, IV3EntryCipher? cipher, byte[]? trailerOverride, IEntryHashProvider? hashProvider = null)
+        IEntryPayloadCodec codec, IV3EntryCipher? cipher, byte[]? trailerOverride, IEntryHashProvider? hashProvider = null, bool convertDpng = false)
     {
         if (!Directory.Exists(inputDir)) throw new DirectoryNotFoundException($"input directory not found: {inputDir}");
         PathGuards.EnsureNoReparseComponents(inputDir, false);
@@ -891,6 +985,8 @@ public static class QlieRepacker
             if (source.Encryption != 0 && cipher == null)
                 throw new UnsupportedEncryptedRewriteException($"entry {source.Index} edited encrypted payload at offset 0x{source.Offset:X}; provide IV3EntryCipher to prove inverse V3 encryption/signature generation");
             var decoded = File.ReadAllBytes(path);
+            if (convertDpng && row.OriginalImageContainer == "DPNG" && Path.GetExtension(source.Name).Equals(".png", StringComparison.OrdinalIgnoreCase) && decoded.AsSpan().StartsWith(new byte[] { 137, 80, 78, 71, 13, 10, 26, 10 }))
+                decoded = QlieDpng.Encode(decoded);
             var encoded = codec.Encode(decoded, source);
             var packed = source.Packed;
             var encryption = 0;

@@ -87,6 +87,11 @@ public static class Program
         if (QlieModernArchive.IsMatch(args[1]))
         {
             var modernManifest = QlieModernArchive.Extract(args[1], output);
+            var optManifest = FindOption(args, "--manifest");
+            if (!string.IsNullOrEmpty(optManifest))
+            {
+                File.Copy(Path.Combine(output, "qlie-v31-manifest.json"), optManifest, true);
+            }
             Console.WriteLine($"extracted {modernManifest.Files.Count} V3.1 entries to {output}");
             return 0;
         }

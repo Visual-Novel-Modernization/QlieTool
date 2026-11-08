@@ -350,7 +350,7 @@ public static class Program
         }
         if (QlieModernArchive.IsMatch(args[1]))
         {
-            var modernManifest = QlieModernArchive.Extract(args[1], output);
+            var modernManifest = QlieModernArchive.Extract(args[1], output, HasOption(args, "--dpng"));
             var optManifest = FindOption(args, "--manifest");
             if (!string.IsNullOrEmpty(optManifest))
             {

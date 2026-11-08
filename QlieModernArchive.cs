@@ -32,7 +32,7 @@ public static class QlieModernArchive
         return a.Entries.Select(e => new FileRecord(e.Name, e.Original, e.Stored, e.Compressed, e.Obfuscated, e.Hash)).ToArray();
     }
 
-    public static Manifest Extract(string path, string outputDirectory)
+    public static Manifest Extract(string path, string outputDirectory, bool convertDpng = false)
     {
         var a = Read(path); Directory.CreateDirectory(outputDirectory);
         byte[]? commonKeyFile = null;
@@ -64,6 +64,10 @@ public static class QlieModernArchive
             }
             if (e.Compressed != 0) payload = QlieV31.Bpe(payload, e.Original);
             else if (payload.Length != e.Original) throw new InvalidDataException($"{e.Name}: decoded size mismatch");
+            if (convertDpng && Path.GetExtension(e.Name).Equals(".png", StringComparison.OrdinalIgnoreCase) && QlieDpng.IsDpng(payload))
+            {
+                payload = QlieDpng.Decode(payload);
+            }
             File.WriteAllBytes(target, payload);
         }
         var manifest = new Manifest { Source = Path.GetFileName(path), Files = a.Entries.Select(e => new FileRecord(e.Name, e.Original, e.Stored, e.Compressed, e.Obfuscated, e.Hash)).ToList() };

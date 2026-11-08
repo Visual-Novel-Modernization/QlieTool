@@ -314,22 +314,7 @@ public sealed class QlieV1Archive : IDisposable
 
     private static uint ComputeLegacyPayloadHash(Stream stream)
     {
-        ulong state = 0, accumulator = 0;
-        Span<byte> qword = stackalloc byte[8];
-        while (true)
-        {
-            var got = 0;
-            while (got < qword.Length)
-            {
-                var read = stream.Read(qword[got..]);
-                if (read == 0) break;
-                got += read;
-            }
-            if (got < qword.Length) break;
-            state = AddWord(state, 0x0307030703070307UL);
-            accumulator = AddWord(accumulator, BinaryPrimitives.ReadUInt64LittleEndian(qword) ^ state);
-        }
-        return unchecked((uint)(accumulator ^ (accumulator >> 32)));
+        return SimdAccelerated.ComputeLegacyPayloadHash(stream);
     }
 
     private static ulong AddWord(ulong left, ulong right)

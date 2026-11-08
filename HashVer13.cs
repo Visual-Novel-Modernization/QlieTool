@@ -379,19 +379,8 @@ public static class HashVer13
             var node = 255;
             while (node >= 0 && (childLeft[node] != node || state.Used[node])) node--;
             if (node < 0) break;
-            var bestCount = 2;
-            var bestA = 0; var bestB = 0;
-            for (var slot = 0; slot < PairTableSize; slot++)
-            {
-                var count = state.PairCount[slot];
-                if (count > bestCount)
-                {
-                    bestCount = count;
-                    bestA = state.PairLeft[slot];
-                    bestB = state.PairRight[slot];
-                }
-            }
-            if (bestCount <= 2 || symbols.Count < 2) break;
+            if (!SimdAccelerated.FindBestPair(state.PairCount, state.PairLeft, state.PairRight, 2, out var bestCount, out var bestA, out var bestB) || symbols.Count < 2)
+                break;
             var oldLength = symbols.Count;
             var next = new List<int>(oldLength);
             var i = 0;

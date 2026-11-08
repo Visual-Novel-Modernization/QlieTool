@@ -5,6 +5,7 @@ using System.Text;
 using System.Text.Json;
 using System.Security.Cryptography;
 using System.Collections.Generic;
+using System.Diagnostics;
 
 namespace QlieTool;
 
@@ -16,6 +17,7 @@ public static class Program
         try
         {
             if (args.Length == 0 || args[0] is "--help" or "-h") { Usage(); return 0; }
+            if (HasOption(args, "--no-simd")) SimdAccelerated.ForceScalar = true;
             return args[0].ToLowerInvariant() switch
             {
                 "list" => RunList(args),
@@ -24,6 +26,7 @@ public static class Program
                 "repack" => RunRepack(args),
                 "verify" => RunVerify(args),
                 "self-test" => RunSelfTest(),
+                "bench" => RunBench(args),
                 _ => throw new ArgumentException($"Unknown command: {args[0]}")
             };
         }
@@ -32,6 +35,266 @@ public static class Program
             Console.Error.WriteLine($"error: {ex.Message}");
             return 2;
         }
+    }
+
+    private static int RunBench(string[] args)
+    {
+        Require(args, 2);
+        var sourcePath = Path.GetFullPath(args[1]);
+        if (!File.Exists(sourcePath)) throw new FileNotFoundException("archive not found", sourcePath);
+
+        Console.WriteLine("==========================================================================================");
+        Console.WriteLine("                QLIE ARCHIVE TOOL - SIMD HARDWARE ACCELERATION BENCHMARK                  ");
+        Console.WriteLine("==========================================================================================");
+        Console.WriteLine($"Target File    : {sourcePath} ({new FileInfo(sourcePath).Length:N0} bytes)");
+        Console.WriteLine($"Hardware Tier  : {SimdAccelerated.GetActiveSimdTier()}");
+        Console.WriteLine($"OS Platform    : {Environment.OSVersion}");
+        Console.WriteLine($"Logical Cores  : {Environment.ProcessorCount}");
+        Console.WriteLine("------------------------------------------------------------------------------------------");
+
+        byte[] payloadData;
+        List<string> entryNames = new();
+        if (QlieModernArchive.IsMatch(sourcePath))
+        {
+            var records = QlieModernArchive.List(sourcePath);
+            entryNames = records.Select(r => r.Name).ToList();
+            using var fs = File.OpenRead(sourcePath);
+            int readLen = (int)Math.Min(fs.Length, 20 * 1024 * 1024);
+            payloadData = new byte[readLen];
+            fs.ReadExactly(payloadData, 0, readLen);
+        }
+        else
+        {
+            using var input = TempInput.CopyArchive(sourcePath, FindOption(args, "--key"), FindOption(args, "--game-key"));
+            using var archive = QlieArchive.Open(input.ArchivePath, input.KeyPath, input.GameKeyPath);
+            entryNames = archive.Entries.Select(e => e.Name).ToList();
+            using var fs = File.OpenRead(input.ArchivePath);
+            int readLen = (int)Math.Min(fs.Length, 20 * 1024 * 1024);
+            payloadData = new byte[readLen];
+            fs.ReadExactly(payloadData, 0, readLen);
+        }
+
+        Console.WriteLine($"Pack Format    : {(QlieModernArchive.IsMatch(sourcePath) ? "FilePackVer3.1" : "FilePackVer3.0/1.0")}");
+        Console.WriteLine($"Indexed Entries: {entryNames.Count} entries");
+        Console.WriteLine($"Payload Sample : {payloadData.Length:N0} bytes ({payloadData.Length / (1024.0 * 1024.0):F2} MB)");
+        Console.WriteLine();
+
+        // [1] Checksum & ArcKey Word Accumulator
+        Console.WriteLine("[1] Stored Checksum & ArcKey Word Accumulation (64B AVX-512 vs 8B Scalar)");
+        int hashRounds = 10;
+        SimdAccelerated.ForceScalar = false;
+        SimdAccelerated.CalculateStoredChecksum(payloadData);
+        SimdAccelerated.ForceScalar = true;
+        SimdAccelerated.CalculateStoredChecksum(payloadData);
+
+        SimdAccelerated.ForceScalar = false;
+        var sw = Stopwatch.StartNew();
+        uint simdSum = 0;
+        for (int i = 0; i < hashRounds; i++) simdSum = SimdAccelerated.CalculateStoredChecksum(payloadData);
+        sw.Stop();
+        double simdHashMs = sw.Elapsed.TotalMilliseconds;
+
+        SimdAccelerated.ForceScalar = true;
+        sw.Restart();
+        uint scalarSum = 0;
+        for (int i = 0; i < hashRounds; i++) scalarSum = SimdAccelerated.CalculateStoredChecksum(payloadData);
+        sw.Stop();
+        double scalarHashMs = sw.Elapsed.TotalMilliseconds;
+        SimdAccelerated.ForceScalar = false;
+
+        if (simdSum != scalarSum) throw new Exception("Checksum hash mismatch between SIMD and Scalar!");
+        double hashBytesTotal = (double)payloadData.Length * hashRounds;
+        double simdHashGbs = (hashBytesTotal / (1024 * 1024 * 1024)) / (simdHashMs / 1000.0);
+        double scalarHashGbs = (hashBytesTotal / (1024 * 1024 * 1024)) / (scalarHashMs / 1000.0);
+        double hashSpeedup = scalarHashMs / simdHashMs;
+        Console.WriteLine($"  - Hardware SIMD (AVX-512) : {simdHashMs,7:F2} ms  ({simdHashGbs,6:F2} GB/s)");
+        Console.WriteLine($"  - Pure Scalar (No SIMD)   : {scalarHashMs,7:F2} ms  ({scalarHashGbs,6:F2} GB/s)");
+        Console.WriteLine($"  -> SPEEDUP: {hashSpeedup:F2}x faster\n");
+
+        // [2] Name Decrypt/Encrypt
+        Console.WriteLine($"[2] Index Entry Name Decrypt/Encrypt ({entryNames.Count} game file names, 50,000 iterations)");
+        byte[][] rawNames = entryNames.Select(n => Encoding.Unicode.GetBytes(n)).ToArray();
+        long totalNameBytes = rawNames.Sum(n => (long)n.Length) * 50000;
+
+        SimdAccelerated.ForceScalar = false;
+        sw.Restart();
+        for (int r = 0; r < 50000; r++)
+        {
+            int seed = r * 17 + 1;
+            for (int i = 0; i < rawNames.Length; i++)
+            {
+                SimdAccelerated.CryptName(rawNames[i], rawNames[i].Length, seed);
+            }
+        }
+        sw.Stop();
+        double simdNameMs = sw.Elapsed.TotalMilliseconds;
+
+        SimdAccelerated.ForceScalar = true;
+        sw.Restart();
+        for (int r = 0; r < 50000; r++)
+        {
+            int seed = r * 17 + 1;
+            for (int i = 0; i < rawNames.Length; i++)
+            {
+                SimdAccelerated.CryptName(rawNames[i], rawNames[i].Length, seed);
+            }
+        }
+        sw.Stop();
+        double scalarNameMs = sw.Elapsed.TotalMilliseconds;
+        SimdAccelerated.ForceScalar = false;
+
+        double simdNameMbs = (totalNameBytes / (1024.0 * 1024.0)) / (simdNameMs / 1000.0);
+        double scalarNameMbs = (totalNameBytes / (1024.0 * 1024.0)) / (scalarNameMs / 1000.0);
+        double nameSpeedup = scalarNameMs / simdNameMs;
+        Console.WriteLine($"  - Hardware SIMD (AVX-512) : {simdNameMs,7:F2} ms  ({simdNameMbs,6:F2} MB/s)");
+        Console.WriteLine($"  - Pure Scalar (No SIMD)   : {scalarNameMs,7:F2} ms  ({scalarNameMbs,6:F2} MB/s)");
+        Console.WriteLine($"  -> SPEEDUP: {nameSpeedup:F2}x faster\n");
+
+        // [3] 1PC / BPE Best-Pair Search
+        Console.WriteLine("[3] 1PC / BPE Compression Tree Best-Pair Search (8,192 slots, 20,000 passes)");
+        int[] pairCounts = new int[8192];
+        int[] pairLeft = new int[8192];
+        int[] pairRight = new int[8192];
+        var rng = new Random(42);
+        for (int i = 0; i < pairCounts.Length; i++)
+        {
+            pairCounts[i] = rng.Next(0, 1000);
+            pairLeft[i] = i / 256;
+            pairRight[i] = i % 256;
+        }
+        pairCounts[4500] = 9999;
+
+        SimdAccelerated.ForceScalar = false;
+        sw.Restart();
+        int simdBest = 0;
+        for (int r = 0; r < 20000; r++)
+        {
+            pairCounts[4500] = 9000 + (r % 100);
+            SimdAccelerated.FindBestPair(pairCounts, pairLeft, pairRight, 0, out simdBest, out _, out _);
+        }
+        sw.Stop();
+        double simdPairMs = sw.Elapsed.TotalMilliseconds;
+
+        SimdAccelerated.ForceScalar = true;
+        sw.Restart();
+        int scalarBest = 0;
+        for (int r = 0; r < 20000; r++)
+        {
+            pairCounts[4500] = 9000 + (r % 100);
+            SimdAccelerated.FindBestPair(pairCounts, pairLeft, pairRight, 0, out scalarBest, out _, out _);
+        }
+        sw.Stop();
+        double scalarPairMs = sw.Elapsed.TotalMilliseconds;
+        SimdAccelerated.ForceScalar = false;
+
+        if (simdBest != scalarBest) throw new Exception("Best pair mismatch between SIMD and Scalar!");
+        double pairSpeedup = scalarPairMs / simdPairMs;
+        Console.WriteLine($"  - Hardware SIMD (AVX-512) : {simdPairMs,7:F2} ms  ({20000.0 / (simdPairMs / 1000.0),8:F0} ops/sec)");
+        Console.WriteLine($"  - Pure Scalar (No SIMD)   : {scalarPairMs,7:F2} ms  ({20000.0 / (scalarPairMs / 1000.0),8:F0} ops/sec)");
+        Console.WriteLine($"  -> SPEEDUP: {pairSpeedup:F2}x faster\n");
+
+        // [4] DPNG Scanline Unfilter
+        Console.WriteLine("[4] DPNG Scanline Unfilter (Filter 2 Up - 1920-byte scanline, 20,000 scanlines)");
+        byte[] scanlineCurr = new byte[1920];
+        byte[] scanlinePrev = new byte[1920];
+        rng.NextBytes(scanlineCurr);
+        rng.NextBytes(scanlinePrev);
+
+        SimdAccelerated.ForceScalar = false;
+        sw.Restart();
+        for (int r = 0; r < 20000; r++)
+        {
+            SimdAccelerated.Unfilter(2, scanlineCurr, scanlineCurr, scanlinePrev, 4);
+        }
+        sw.Stop();
+        double simdUnfilterMs = sw.Elapsed.TotalMilliseconds;
+
+        SimdAccelerated.ForceScalar = true;
+        sw.Restart();
+        for (int r = 0; r < 20000; r++)
+        {
+            SimdAccelerated.Unfilter(2, scanlineCurr, scanlineCurr, scanlinePrev, 4);
+        }
+        sw.Stop();
+        double scalarUnfilterMs = sw.Elapsed.TotalMilliseconds;
+        SimdAccelerated.ForceScalar = false;
+
+        double unfilterSpeedup = scalarUnfilterMs / simdUnfilterMs;
+        Console.WriteLine($"  - Hardware SIMD (AVX-512) : {simdUnfilterMs,7:F2} ms  ({(20000.0 * 1920) / (1024 * 1024 * (simdUnfilterMs / 1000.0)),6:F2} MB/s)");
+        Console.WriteLine($"  - Pure Scalar (No SIMD)   : {scalarUnfilterMs,7:F2} ms  ({(20000.0 * 1920) / (1024 * 1024 * (scalarUnfilterMs / 1000.0)),6:F2} MB/s)");
+        Console.WriteLine($"  -> SPEEDUP: {unfilterSpeedup:F2}x faster\n");
+
+        // [5] DPNG RGB24 to RGBA32 Unpack
+        Console.WriteLine("[5] DPNG RGB24 to RGBA32 Pixel Unpack (1920 pixels = 5,760B -> 7,680B, 10,000 scanlines)");
+        byte[] rgbScan = new byte[1920 * 3];
+        byte[] rgbaResult = new byte[1920 * 4];
+        rng.NextBytes(rgbScan);
+
+        SimdAccelerated.ForceScalar = false;
+        sw.Restart();
+        for (int r = 0; r < 10000; r++)
+        {
+            SimdAccelerated.ConvertRgbToRgba(rgbScan, rgbaResult, null);
+        }
+        sw.Stop();
+        double simdRgbMs = sw.Elapsed.TotalMilliseconds;
+
+        SimdAccelerated.ForceScalar = true;
+        sw.Restart();
+        for (int r = 0; r < 10000; r++)
+        {
+            SimdAccelerated.ConvertRgbToRgba(rgbScan, rgbaResult, null);
+        }
+        sw.Stop();
+        double scalarRgbMs = sw.Elapsed.TotalMilliseconds;
+        SimdAccelerated.ForceScalar = false;
+
+        double rgbSpeedup = scalarRgbMs / simdRgbMs;
+        Console.WriteLine($"  - Hardware SIMD (AVX-512) : {simdRgbMs,7:F2} ms  ({(10000.0 * 1920 * 3) / (1024 * 1024 * (simdRgbMs / 1000.0)),6:F2} MB/s)");
+        Console.WriteLine($"  - Pure Scalar (No SIMD)   : {scalarRgbMs,7:F2} ms  ({(10000.0 * 1920 * 3) / (1024 * 1024 * (scalarRgbMs / 1000.0)),6:F2} MB/s)");
+        Console.WriteLine($"  -> SPEEDUP: {rgbSpeedup:F2}x faster\n");
+
+        // [6] PNG Chunk CRC-32
+        Console.WriteLine("[6] PNG Chunk CRC-32 Calculation (100 MB data stream)");
+        byte[] crcBuffer = new byte[10 * 1024 * 1024];
+        rng.NextBytes(crcBuffer);
+        int crcRounds = 10;
+
+        SimdAccelerated.ForceScalar = false;
+        sw.Restart();
+        uint hwCrc = 0;
+        for (int r = 0; r < crcRounds; r++) hwCrc = SimdAccelerated.ComputeCrc32(0x49444154, crcBuffer);
+        sw.Stop();
+        double hwCrcMs = sw.Elapsed.TotalMilliseconds;
+
+        SimdAccelerated.ForceScalar = true;
+        sw.Restart();
+        uint swCrc = 0;
+        for (int r = 0; r < crcRounds; r++) swCrc = SimdAccelerated.ComputeCrc32(0x49444154, crcBuffer);
+        sw.Stop();
+        double swCrcMs = sw.Elapsed.TotalMilliseconds;
+        SimdAccelerated.ForceScalar = false;
+
+        if (hwCrc != swCrc) throw new Exception("CRC32 mismatch between Hardware and Software!");
+        double crcSpeedup = swCrcMs / hwCrcMs;
+        double crcTotalMb = (double)crcBuffer.Length * crcRounds / (1024 * 1024);
+        Console.WriteLine($"  - Hardware CRC32 (CLMUL)  : {hwCrcMs,7:F2} ms  ({crcTotalMb / (hwCrcMs / 1000.0),6:F2} MB/s)");
+        Console.WriteLine($"  - Software Bitwise CRC32  : {swCrcMs,7:F2} ms  ({crcTotalMb / (swCrcMs / 1000.0),6:F2} MB/s)");
+        Console.WriteLine($"  -> SPEEDUP: {crcSpeedup:F2}x faster\n");
+
+        Console.WriteLine("==========================================================================================");
+        Console.WriteLine("                                  SUMMARY OF RESULTS                                      ");
+        Console.WriteLine("==========================================================================================");
+        Console.WriteLine($"{"Kernel Operation",-38} | {"AVX-512 / HW",-14} | {"Pure Scalar",-14} | {"Speedup Ratio",-14}");
+        Console.WriteLine("---------------------------------------+----------------+----------------+----------------");
+        Console.WriteLine($"{"[1] Payload Word Accumulation (AddW)",-38} | {simdHashMs,11:F2} ms | {scalarHashMs,11:F2} ms | {hashSpeedup,12:F2}x");
+        Console.WriteLine($"{"[2] Name Decrypt/Encrypt (CryptName)",-38} | {simdNameMs,11:F2} ms | {scalarNameMs,11:F2} ms | {nameSpeedup,12:F2}x");
+        Console.WriteLine($"{"[3] 1PC BPE Best Pair (FindBestPair)",-38} | {simdPairMs,11:F2} ms | {scalarPairMs,11:F2} ms | {pairSpeedup,12:F2}x");
+        Console.WriteLine($"{"[4] DPNG Scanline Unfilter (Up)",-38} | {simdUnfilterMs,11:F2} ms | {scalarUnfilterMs,11:F2} ms | {unfilterSpeedup,12:F2}x");
+        Console.WriteLine($"{"[5] RGB24 to RGBA32 Unpack (Shuffle)",-38} | {simdRgbMs,11:F2} ms | {scalarRgbMs,11:F2} ms | {rgbSpeedup,12:F2}x");
+        Console.WriteLine($"{"[6] Chunk CRC-32 (PCLMUL vs Bitwise)",-38} | {hwCrcMs,11:F2} ms | {swCrcMs,11:F2} ms | {crcSpeedup,12:F2}x");
+        Console.WriteLine("==========================================================================================");
+        return 0;
     }
 
     private static void Usage()
@@ -43,6 +306,7 @@ public static class Program
         Console.WriteLine("  clone <manifest.json> <output.pack> --source <original.pack> --input-dir <extracted-dir> (compatibility alias)");
         Console.WriteLine("  verify <archive.pack> [--key key.fkey] [--game-key keydata.bin]");
         Console.WriteLine("  self-test");
+        Console.WriteLine("  bench <archive.pack> [--key key.fkey] [--game-key keydata.bin]");
         Console.WriteLine("V1.0 repack requires literal entries for edits; unchanged entries stream-copy. V3.1 repack validates keyfile and rebuilds all versioned sections.");
         Console.WriteLine("repack rebuilds payloads, index and footer; unchanged payload bytes may be reused.");
     }
@@ -348,7 +612,8 @@ public static class Program
                 }
             }
             SyntheticFixture.VerifyCipherKnownVectors();
-            Console.WriteLine("self-test passed (V3 index/name cipher, 1PC decode, variable-size grow/shrink repack and readback, streamed unchanged reuse, relocated index/footer, opaque gap/trailer preservation, encrypted decode/repack/readback, synthetic pack_keyfile chain with non-empty game-key, clear-name/null/empty/non-empty fixed vectors, raw-edit rejection)");
+            SimdAccelerated.RunSelfVerification();
+            Console.WriteLine($"self-test passed [Active SIMD Tier: {SimdAccelerated.GetActiveSimdTier()}] (V3 index/name cipher, 1PC decode, variable-size grow/shrink repack and readback, streamed unchanged reuse, relocated index/footer, opaque gap/trailer preservation, encrypted decode/repack/readback, synthetic pack_keyfile chain with non-empty game-key, clear-name/null/empty/non-empty fixed vectors, raw-edit rejection, SIMD parity verified)");
             return 0;
         }
         finally { try { Directory.Delete(root, true); } catch { } }
@@ -689,14 +954,14 @@ public sealed class QlieArchive : IDisposable
         var bytes = cp932.GetBytes(name);
         if (bytes.Length > 0x100) throw new InvalidDataException($"entry name exceeds 256 CP932 bytes: {name}");
         var key = unchecked(bytes.Length + (unchecked((int)arcKey) ^ 0x3E));
-        for (var k = 0; k < bytes.Length; k++) bytes[k] ^= unchecked((byte)(((k + 1) ^ key) + (k + 1)));
+        SimdAccelerated.CryptName(bytes, bytes.Length, key);
         return bytes;
     }
 
     private void DecryptName(byte[] bytes, int length)
     {
         var key = unchecked(length + (unchecked((int)arcKey) ^ 0x3E));
-        for (var k=0;k<length;k++) bytes[k] ^= unchecked((byte)(((k+1)^key)+(k+1)));
+        SimdAccelerated.CryptName(bytes, length, key);
     }
 
     public Stream OpenStored(QlieEntry e)
@@ -750,10 +1015,8 @@ public sealed class QlieArchive : IDisposable
     private static long ReadInt64At(Stream s,long pos){s.Position=pos;return ReadInt64(s);}
     private static ushort ReadUInt16(Stream s)=>BitConverter.ToUInt16(ReadExactly(s,2));
     private static uint ReadUInt32(Stream s)=>BitConverter.ToUInt32(ReadExactly(s,4));
-    internal static uint CalculateArcKey(ReadOnlySpan<byte> data)
-    { ulong hash=0,key=0; for(var i=0;i+8<=data.Length;i+=8){hash=PackedMath.AddW(hash,0x0307030703070307);key=PackedMath.AddW(key,BitConverter.ToUInt64(data.Slice(i,8))^hash);} return (uint)(key^(key>>32))&0x0fffffff; }
-    internal static uint CalculateStoredChecksum(ReadOnlySpan<byte> data)
-    { ulong state=0,acc=0; for(var i=0;i+8<=data.Length;i+=8){state=PackedMath.AddW(state,0x0307030703070307);acc=PackedMath.AddW(acc,BitConverter.ToUInt64(data.Slice(i,8))^state);} return (uint)(acc^(acc>>32)); }
+    internal static uint CalculateArcKey(ReadOnlySpan<byte> data) => SimdAccelerated.CalculateArcKey(data);
+    internal static uint CalculateStoredChecksum(ReadOnlySpan<byte> data) => SimdAccelerated.CalculateStoredChecksum(data);
     public static byte[]? Decompress1Pc(byte[] input, uint expectedSize)
     {
         const int maxOutput = 256 * 1024 * 1024;
@@ -1148,7 +1411,7 @@ public static class SyntheticFixture
     private static byte[] MakePacked(){var body=PackedPlain;using var m=new MemoryStream();m.Write(BitConverter.GetBytes(0xff435031u));m.WriteByte(0);m.WriteByte(0);m.Write(BitConverter.GetBytes(body.Length));m.WriteByte(0);m.WriteByte(255); // skip 128 nodes? construct simple leaf table: 0..255 identity encoded as 255, then one entry
         // Correct table: count byte 255 => skip 128, then count 0 => one mapping for symbol 128; remaining table incomplete. Use one block with 256 identity mappings encoded as 127?
         m.SetLength(0); m.Write(BitConverter.GetBytes(0xff435031u));m.WriteByte(0);m.WriteByte(0);m.WriteByte(0);m.WriteByte(0);m.Write(BitConverter.GetBytes(body.Length));m.WriteByte(127); for(var i=0;i<128;i++)m.WriteByte((byte)i); m.WriteByte(127); for(var i=128;i<256;i++)m.WriteByte((byte)i); m.Write(BitConverter.GetBytes(body.Length)); m.Write(body); return m.ToArray();}
-    private static byte[] EncodeName(string name,uint arc){var b=Encoding.GetEncoding(932).GetBytes(name);var key=unchecked(b.Length+(unchecked((int)arc)^0x3E));for(var k=0;k<b.Length;k++)b[k]^=unchecked((byte)(((k+1)^key)+(k+1)));return b;}
+    private static byte[] EncodeName(string name,uint arc){var b=Encoding.GetEncoding(932).GetBytes(name);var key=unchecked(b.Length+(unchecked((int)arc)^0x3E));SimdAccelerated.CryptName(b,b.Length,key);return b;}
     public static readonly byte[] EncryptedPlain = Enumerable.Range(0, 32).Select(i => (byte)(0x40 + i)).ToArray();
     public static void CreateEncrypted(string path, string keyPath, string gameKeyPath)
     {

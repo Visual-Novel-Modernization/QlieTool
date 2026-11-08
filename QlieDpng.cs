@@ -80,9 +80,20 @@ public static class QlieDpng
         int rowBytes = checked(width * channels); var raw = new byte[checked((rowBytes + 1) * height)];
         using (var z = new ZLibStream(new MemoryStream(idat, false), CompressionMode.Decompress)) ReadExactly(z, raw);
         var scan = new byte[checked(rowBytes * height)];
-        for (int y = 0; y < height; y++) { byte filter = raw[y * (rowBytes + 1)]; var src = raw.AsSpan(y * (rowBytes + 1) + 1, rowBytes); var dst = scan.AsSpan(y * rowBytes, rowBytes); var prev = y == 0 ? Span<byte>.Empty : scan.AsSpan((y - 1) * rowBytes, rowBytes); Unfilter(filter, src, dst, prev, channels); }
+        for (int y = 0; y < height; y++) { byte filter = raw[y * (rowBytes + 1)]; var src = raw.AsSpan(y * (rowBytes + 1) + 1, rowBytes); var dst = scan.AsSpan(y * rowBytes, rowBytes); var prev = y == 0 ? Span<byte>.Empty : scan.AsSpan((y - 1) * rowBytes, rowBytes); SimdAccelerated.Unfilter(filter, src, dst, prev, channels); }
         var result = new byte[checked(width * height * 4)];
-        for (int i = 0; i < width * height; i++) { int s = i * channels, d = i * 4; switch (colorType) { case 6: scan.AsSpan(s, 4).CopyTo(result.AsSpan(d, 4)); break; case 2: result[d]=scan[s]; result[d+1]=scan[s+1]; result[d+2]=scan[s+2]; result[d+3]=AlphaForRgb(scan, s, transparency); break; case 3: int ix=scan[s]; if (ix*3+2>=palette!.Length) throw new InvalidDataException("PNG palette index out of range"); result[d]=palette[ix*3]; result[d+1]=palette[ix*3+1]; result[d+2]=palette[ix*3+2]; result[d+3]=(transparency is not null && ix<transparency.Length)?transparency[ix]:(byte)255; break; case 0: result[d]=result[d+1]=result[d+2]=scan[s]; result[d+3]=AlphaForGray(scan[s], transparency); break; case 4: result[d]=result[d+1]=result[d+2]=scan[s]; result[d+3]=scan[s+1]; break; } }
+        if (!SimdAccelerated.ForceScalar && colorType == 6)
+        {
+            scan.AsSpan().CopyTo(result);
+        }
+        else if (!SimdAccelerated.ForceScalar && colorType == 2)
+        {
+            SimdAccelerated.ConvertRgbToRgba(scan, result, transparency);
+        }
+        else
+        {
+            for (int i = 0; i < width * height; i++) { int s = i * channels, d = i * 4; switch (colorType) { case 6: scan.AsSpan(s, 4).CopyTo(result.AsSpan(d, 4)); break; case 2: result[d]=scan[s]; result[d+1]=scan[s+1]; result[d+2]=scan[s+2]; result[d+3]=AlphaForRgb(scan, s, transparency); break; case 3: int ix=scan[s]; if (ix*3+2>=palette!.Length) throw new InvalidDataException("PNG palette index out of range"); result[d]=palette[ix*3]; result[d+1]=palette[ix*3+1]; result[d+2]=palette[ix*3+2]; result[d+3]=(transparency is not null && ix<transparency.Length)?transparency[ix]:(byte)255; break; case 0: result[d]=result[d+1]=result[d+2]=scan[s]; result[d+3]=AlphaForGray(scan[s], transparency); break; case 4: result[d]=result[d+1]=result[d+2]=scan[s]; result[d+3]=scan[s+1]; break; } }
+        }
         return result;
     }
 
@@ -93,6 +104,6 @@ public static class QlieDpng
 
     private static byte[] EncodePng(byte[] rgba, int width, int height) { using var o=new MemoryStream(); o.Write(PngSignature); using var raw=new MemoryStream(); for(int y=0;y<height;y++){raw.WriteByte(0);raw.Write(rgba,y*width*4,width*4);} using var z=new MemoryStream(); raw.Position=0; using(var zs=new ZLibStream(z,CompressionLevel.Optimal,true)) raw.CopyTo(zs); WriteChunk(o,0x49484452,Header(width,height)); WriteChunk(o,0x49444154,z.ToArray()); WriteChunk(o,0x49454E44,Array.Empty<byte>()); return o.ToArray(); }
     private static byte[] Header(int w,int h){var b=new byte[13];BinaryPrimitives.WriteUInt32BigEndian(b,(uint)w);BinaryPrimitives.WriteUInt32BigEndian(b.AsSpan(4),(uint)h);b[8]=8;b[9]=6;b[10]=b[11]=b[12]=0;return b;}
-    private static void WriteChunk(Stream s,uint t,byte[] d){WriteU32BE(s,(uint)d.Length);WriteU32BE(s,t);s.Write(d);uint c=0xffffffff; Span<byte> q=stackalloc byte[4];using var m=new MemoryStream();WriteU32BE(m,t);m.Write(d);foreach(byte x in m.ToArray()){c^=x;for(int i=0;i<8;i++)c=(c&1)!=0?(c>>1)^0xedb88320u:c>>1;}WriteU32BE(s,~c);}
+    private static void WriteChunk(Stream s,uint t,byte[] d){WriteU32BE(s,(uint)d.Length);WriteU32BE(s,t);s.Write(d);uint crc=SimdAccelerated.ComputeCrc32(t,d);WriteU32BE(s,crc);}
     private static int ReadI32(ReadOnlySpan<byte>b,int p)=>BinaryPrimitives.ReadInt32LittleEndian(b[p..]); private static uint ReadU32(ReadOnlySpan<byte>b,int p)=>BinaryPrimitives.ReadUInt32LittleEndian(b[p..]); private static uint ReadU32BE(ReadOnlySpan<byte>b,int p)=>BinaryPrimitives.ReadUInt32BigEndian(b[p..]); private static void WriteI32(Stream s,int v)=>WriteU32(s,unchecked((uint)v)); private static void WriteU32(Stream s,uint v){Span<byte>b=stackalloc byte[4];BinaryPrimitives.WriteUInt32LittleEndian(b,v);s.Write(b);} private static void WriteU32BE(Stream s,uint v){Span<byte>b=stackalloc byte[4];BinaryPrimitives.WriteUInt32BigEndian(b,v);s.Write(b);} private static void ReadExactly(Stream s,byte[] b){int p=0,n;while(p<b.Length&&(n=s.Read(b,p,b.Length-p))>0)p+=n;if(p!=b.Length)throw new InvalidDataException("truncated PNG data");}
 }
